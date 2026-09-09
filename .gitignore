@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Large / not needed to run the bot (and avoids republishing Kaggle data)
+stockfish/
+train-an-ai-to-play-chess/
+
+# Scratch / test artifacts
+_tmp*.js
+_test_*.py
+*.log
+
+# Keep the trained weights (needed to play) - chess_model.pt is committed.

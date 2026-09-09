@@ -1,0 +1,17 @@
+# Render Blueprint for the AI Chess Bot (free web service, Docker runtime).
+# Deploy: push this repo to GitHub, then "New +" -> "Blueprint" -> pick the repo,
+# or use `render blueprint launch` from the Render CLI. Plan = free, $0/month.
+
+services:
+  - type: web
+    name: chess-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: MAX_CONCURRENT
+        value: "4"
+      - key: MAX_DEPTH
+        value: "4"
+      - key: TORCH_THREADS
+        value: "2"

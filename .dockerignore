@@ -1,0 +1,18 @@
+.git/
+.gitignore
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# never ship training data or the engine binary into the image
+stockfish/
+train-an-ai-to-play-chess/
+*.csv
+
+# dev docs / generators / local web test files
+DEPLOY.md
+generate_notebook.py
+generate_bot_notebook.py
+chess_bot.i*pynb
+_tmp*.js
+_test_*.py
