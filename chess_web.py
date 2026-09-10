@@ -81,7 +81,10 @@ def _clamp(params):
 
 
 def _move_pair(before_fen, uci):
-    """Find the legal move matching from/to (auto-queen promotions)."""
+    """Find the legal move matching from/to.
+
+    Honors an explicit promotion piece (e.g. 'e7e8n'); falls back to queen
+    for legacy 4-char input without a promotion suffix."""
     if not uci or len(uci) not in (4, 5) or not uci.isalnum():
         return None, None
     try:
@@ -89,6 +92,8 @@ def _move_pair(before_fen, uci):
         m = chess.Move.from_uci(uci)
     except ValueError:
         return None, None
+    if len(uci) == 5:
+        return (m, b) if m in b.legal_moves else (None, None)
     matches = [x for x in b.legal_moves
                if x.from_square == m.from_square and x.to_square == m.to_square]
     if not matches:
@@ -119,6 +124,19 @@ def _status(board):
 
 def _turn_status(board):
     return "Check! Your move" if board.is_check() else "Your turn"
+
+
+def _draw_board(board):
+    """Return (over, result, status). Treats threefold repetition and the
+    fifty-move rule as immediate draws (online-play style), in addition to
+    python-chess's automatic game-over conditions."""
+    if board.is_repetition(3):
+        return True, "1/2-1/2", "Draw by threefold repetition"
+    if board.is_fifty_moves():
+        return True, "1/2-1/2", "Draw by fifty-move rule"
+    if board.is_game_over():
+        return True, board.result(), _status(board)
+    return False, None, None
 
 
 app = Flask(__name__)
@@ -217,10 +235,11 @@ def make_move():
     human_color = side
     bot_is_white = human_color != "w"
 
-    if board.is_game_over():
+    over, result, reason = _draw_board(board)
+    if over:
         resp["game_over"] = True
-        resp["result"] = board.result()
-        resp["status"] = _status(board)
+        resp["result"] = result
+        resp["status"] = reason
         resp["fen"] = fen_after_human
         return jsonify(resp)
 
@@ -237,10 +256,13 @@ def make_move():
     resp["bot_move"] = bot_uci
     resp["bot_san"] = san_bot
     resp["fen"] = board.fen()
-    resp["status"] = _turn_status(board) if not board.is_game_over() else _status(board)
-    if board.is_game_over():
+    over, result, reason = _draw_board(board)
+    if over:
         resp["game_over"] = True
-        resp["result"] = board.result()
+        resp["result"] = result
+        resp["status"] = reason
+    else:
+        resp["status"] = _turn_status(board)
     return jsonify(resp)
 
 
@@ -298,6 +320,17 @@ INDEX_HTML = r"""<!doctype html>
   .hint { font-size:12px; opacity:.7; margin-top:8px; line-height:1.5; }
   .shake { animation:shake .3s; }
   @keyframes shake { 25%{transform:translateX(-4px)} 75%{transform:translateX(4px)} }
+  #promo { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:600;
+           display:flex; align-items:center; justify-content:center; }
+  #promo.hidden { display:none; }
+  #promo-box { display:flex; gap:8px; background:#3a3633; padding:12px;
+               border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+               align-items:center; }
+  #promo-box button { width:64px; height:64px; padding:0; background:#24211f;
+           border:1px solid #555; border-radius:8px; cursor:pointer;
+           display:flex; align-items:center; justify-content:center; }
+  #promo-box button:hover { background:#35312e; }
+  #promo-box img { width:56px; height:56px; pointer-events:none; }
 </style>
 </head>
 <body>
@@ -328,11 +361,14 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status">Your turn</div>
     <div id="moves"></div>
     <div class="hint">Drag pieces to move. Or click a piece, then click a
-      highlighted square to move there. Pawns auto-promote to queen.
-      Stockfish is used for rating in the CLI; the bot here is the neural
-      search engine from chess_main.ipynb / chess_bot.py.</div>
+      highlighted square to move there. When a pawn reaches the last rank,
+      choose the promotion piece. Stockfish is used for rating in the CLI;
+      the bot here is the neural search engine from chess_main.ipynb /
+      chess_bot.py.</div>
   </div>
 </div>
+
+<div id="promo" class="hidden"><div id="promo-box"></div></div>
 
 <script>
 const files = ['a','b','c','d','e','f','g','h'];
@@ -539,14 +575,19 @@ async function clickCell(sq) {
 async function sendMove(from, to) {
   if (state.thinking || state.over) return;
   const pc = pieceAt(from);
-  let promotion = null;
+  let uci = from + to;
   if (pc && pc.toLowerCase() === 'p') {
     const toRank = to[1];
-    if ((pc === 'P' && toRank === '8') || (pc === 'p' && toRank === '1')) promotion = 'q';
+    if ((pc === 'P' && toRank === '8') || (pc === 'p' && toRank === '1')) {
+      const color = pc === pc.toUpperCase() ? 'w' : 'b';
+      const promo = await pickPromotion(color);
+      if (!promo) return;
+      uci = from + to + promo;
+    }
   }
   const body = {
-    fen: state.fen, uci: from + to, mode: state.mode, depth: state.depth,
-    side: state.myColor, promotion,
+    fen: state.fen, uci, mode: state.mode, depth: state.depth,
+    side: state.myColor,
   };
   setThinking(true);
   try {
@@ -582,6 +623,27 @@ async function sendMove(from, to) {
     setThinking(false);
   }
   render();
+}
+
+function pickPromotion(color) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('promo');
+    const box = document.getElementById('promo-box');
+    box.innerHTML = '';
+    ['q', 'r', 'b', 'n'].forEach(p => {
+      const btn = document.createElement('button');
+      const img = document.createElement('img');
+      img.src = `/pieces/${color}${p.toUpperCase()}.svg`;
+      img.alt = p;
+      btn.appendChild(img);
+      btn.addEventListener('click', () => {
+        overlay.classList.add('hidden');
+        resolve(p);
+      });
+      box.appendChild(btn);
+    });
+    overlay.classList.remove('hidden');
+  });
 }
 
 function addMove(no, white, black) {
