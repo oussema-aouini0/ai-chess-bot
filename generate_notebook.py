@@ -561,15 +561,65 @@ def evaluate_board(board, nn_model=None):
     return score
 
 
-def order_moves(board):
-    \"\"\"Order moves to improve alpha-beta pruning: captures first (MVV-LVA).\"\"\"
+import random
+import time
+
+MATE = 99999
+MATE_ENTERING = MATE - 256               # scores of this magnitude (or more) are mates
+_MAX_QDEPTH = 8                          # quiescence depth cap (capture chains)
+TT_SIZE = 1 << 18                        # bounded transposition table (memory-safe)
+FLAG_EXACT, FLAG_UPPER, FLAG_LOWER = 1, 0, 2
+_TT = {}
+
+
+class _TimeUp(Exception):
+    \"\"\"Internal: abort current depth when the time budget is exhausted.\"\"\"
+    pass
+
+
+# Deterministic Zobrist keys (64-bit) for the transposition table.
+_rng = random.Random(0x5EED)
+_ZOBRIST = [[_rng.getrandbits(64) for _ in range(64)] for _ in range(12)]
+_ZOB_TURN = _rng.getrandbits(64)
+_ZOB_CASTLE = [_rng.getrandbits(64) for _ in range(16)]
+_ZOB_EP = [_rng.getrandbits(64) for _ in range(64)]
+
+
+def zobrist_key(board):
+    key = _ZOB_TURN if board.turn == chess.WHITE else 0
+    cr = board.castling_rights
+    castle_idx = ((cr >> 56) & 1) * 8 + ((cr >> 63) & 1) * 4 \
+        + (cr & 1) * 2 + ((cr >> 7) & 1)
+    key ^= _ZOB_CASTLE[castle_idx]
+    ep = board.ep_square
+    if ep is not None:
+        key ^= _ZOB_EP[ep]
+    for sq, piece in board.piece_map().items():
+        color = 1 if piece.color == chess.WHITE else 0
+        key ^= _ZOBRIST[(piece.piece_type - 1) * 2 + color][sq]
+    return key
+
+
+def order_moves(board, tt_move=None, killers=None, history=None):
+    \"\"\"Order moves to improve alpha-beta pruning: TT best first, then killer
+    moves, then MVV-LVA captures, then the history heuristic for quiet moves.\"\"\"
+    if killers is None:
+        killers = ()
+    hist = history if history is not None else {}
+
     def move_score(move):
+        if move == tt_move:
+            return float('inf')
+        if move in killers:
+            return 1e8
         s = 0
         if board.is_capture(move):
             victim = board.piece_type_at(move.to_square)
             attacker = board.piece_type_at(move.from_square)
             if victim:
                 s += 10000 + 10 * PIECE_VALUES.get(victim, 0) - PIECE_VALUES.get(attacker, 0)
+        else:
+            s += hist.get((move.from_square, move.to_square), 0)
         if board.gives_check(move):
             s += 2000
         if move.promotion:
@@ -579,9 +629,63 @@ def order_moves(board):
     return sorted(board.legal_moves, key=move_score, reverse=True)
 
 
-def quiescence(board, alpha, beta, is_maximizing):
-    \"\"\"Search only captures at leaf nodes to reduce the horizon effect.\"\"\"
-    stand_pat = evaluate_board(board)
+def _time_up(ctx):
+    deadline = ctx["deadline"]
+    if deadline is None:
+        return False
+    ctx["nodes"] += 1
+    if ctx["nodes"] & 255 == 0 and time.monotonic() > deadline:
+        ctx["hit"] = True
+        return True
+    return False
+
+
+def _leaf_eval(board, nn_model=None, ply=0):
+    \"\"\"PST evaluation with ply-aware mate scores so the TT cannot mix mate
+    scores from different plies (mate-distance correctness).\"\"\"
+    v = evaluate_board(board, nn_model)
+    if nn_model is None:
+        if v >= MATE_ENTERING:
+            return MATE - ply
+        if v <= -MATE_ENTERING:
+            return -MATE + ply
+    return v
+
+
+def _adj_store(score, ply):
+    if score >= MATE_ENTERING:
+        return score + ply
+    if score <= -MATE_ENTERING:
+        return score - ply
+    return score
+
+
+def _adj_read(score, ply):
+    if score >= MATE_ENTERING:
+        return score - ply
+    if score <= -MATE_ENTERING:
+        return score + ply
+    return score
+
+
+def _store_tt(key, depth, flag, score, move):
+    _TT[key] = (depth, flag, score, move)
+    if len(_TT) > TT_SIZE:
+        _TT.clear()
+
+
+def quiescence(board, alpha, beta, is_maximizing, ctx=None, ply=0, qdepth=_MAX_QDEPTH):
+    \"\"\"Search only captures at leaf nodes to reduce the horizon effect.
+    Depth is capped (`qdepth`) and it never recurses into quiet moves, so a
+    capture chain stays bounded and cannot stall iterative deepening.\"\"\"
+    if ctx is None:
+        ctx = {"deadline": None, "nodes": 0, "hit": False}
+    if _time_up(ctx):
+        raise _TimeUp()
+    if qdepth <= 0 or board.is_game_over():
+        return _leaf_eval(board, ply=ply)
+
+    stand_pat = _leaf_eval(board, ply=ply)
     if is_maximizing:
         if stand_pat >= beta:
             return beta
@@ -591,36 +695,62 @@ def quiescence(board, alpha, beta, is_maximizing):
             return alpha
         beta = min(beta, stand_pat)
 
-    for move in board.legal_moves:
-        if board.is_capture(move):
-            board.push(move)
-            score = quiescence(board, alpha, beta, not is_maximizing)
+    for move in order_moves(board):
+        if not board.is_capture(move):
+            continue
+        board.push(move)
+        try:
+            score = quiescence(board, alpha, beta, not is_maximizing, ctx,
+                               ply + 1, qdepth - 1)
+        finally:
             board.pop()
-            if is_maximizing:
-                alpha = max(alpha, score)
-                if alpha >= beta:
-                    return beta
-            else:
-                beta = min(beta, score)
-                if alpha >= beta:
-                    return alpha
+        if is_maximizing:
+            alpha = max(alpha, score)
+            if alpha >= beta:
+                return beta
+        else:
+            beta = min(beta, score)
+            if alpha >= beta:
+                return alpha
 
     return alpha if is_maximizing else beta
 
 
-def minimax(board, depth, alpha, beta, is_maximizing, nn_model=None):
-    \"\"\"Alpha-beta minimax. With nn_model, leaf positions are scored by the
-    neural net in one batched forward pass (no quiescence needed). Without it,
-    quiescence search is used with PST evaluation.\"\"\"
+def minimax(board, depth, alpha, beta, is_maximizing, nn_model=None,
+            ctx=None, ply=0, use_tt=True):
+    \"\"\"Alpha-beta minimax with a transposition table, killer moves and a
+    history heuristic. With nn_model, leaf positions are scored by the neural
+    net in one batched forward pass (no quiescence, and the TT is disabled
+    so PST and NN scores never mix). Without it, quiescence search is used
+    with PST evaluation.\"\"\"
+    if _time_up(ctx):
+        raise _TimeUp()
     if board.is_game_over():
-        return evaluate_board(board, nn_model)
+        return _leaf_eval(board, nn_model, ply)
+
+    use_tt = use_tt and nn_model is None
+    key = zobrist_key(board) if use_tt else None
+    tt_move = None
+    if key is not None:
+        entry = _TT.get(key)
+        if entry is not None:
+            tt_move = entry[3]
+            if entry[0] >= depth:
+                cached = _adj_read(entry[2], ply)
+                if entry[1] == FLAG_EXACT:
+                    return cached
+                if entry[1] == FLAG_LOWER and cached >= beta:
+                    return cached
+                if entry[1] == FLAG_UPPER and cached <= alpha:
+                    return cached
 
     if depth == 0:
         if nn_model is None:
-            return quiescence(board, alpha, beta, is_maximizing)
-        # Neural leaf: evaluate every child position in a single batch.
+            return quiescence(board, alpha, beta, is_maximizing, ctx, ply)
         child_boards = []
         for move in order_moves(board):
+            if _time_up(ctx):
+                raise _TimeUp()
             board.push(move)
             child_boards.append(board.copy())
             board.pop()
@@ -629,54 +759,162 @@ def minimax(board, depth, alpha, beta, is_maximizing, nn_model=None):
             return float(max(scores))
         return float(min(scores))
 
+    killers = (ctx or {}).get("killers", [])
+    hist = (ctx or {}).get("history", {})
+    moves = order_moves(board, tt_move=tt_move,
+                        killers=killers[ply] if ply < len(killers) else None,
+                        history=hist)
+
     if is_maximizing:
-        max_eval = -float('inf')
-        for move in order_moves(board):
+        best = -float('inf')
+        best_move = None
+        for move in moves:
+            if _time_up(ctx):
+                raise _TimeUp()
             board.push(move)
-            eval_score = minimax(board, depth - 1, alpha, beta, False, nn_model)
-            board.pop()
-            max_eval = max(max_eval, eval_score)
-            alpha = max(alpha, eval_score)
+            try:
+                value = minimax(board, depth - 1, alpha, beta, False,
+                                nn_model, ctx, ply + 1, use_tt)
+            finally:
+                board.pop()
+            if best_move is None or value > best:
+                best, best_move = value, move
+            alpha = max(alpha, value)
             if beta <= alpha:
+                cutoff = True
                 break
-        return max_eval
+        else:
+            cutoff = False
     else:
-        min_eval = float('inf')
-        for move in order_moves(board):
+        best = float('inf')
+        best_move = None
+        for move in moves:
+            if _time_up(ctx):
+                raise _TimeUp()
             board.push(move)
-            eval_score = minimax(board, depth - 1, alpha, beta, True, nn_model)
-            board.pop()
-            min_eval = min(min_eval, eval_score)
-            beta = min(beta, eval_score)
+            try:
+                value = minimax(board, depth - 1, alpha, beta, True,
+                                nn_model, ctx, ply + 1, use_tt)
+            finally:
+                board.pop()
+            if best_move is None or value < best:
+                best, best_move = value, move
+            beta = min(beta, value)
             if beta <= alpha:
+                cutoff = True
                 break
-        return min_eval
+        else:
+            cutoff = False
+
+    if cutoff:
+        best_move = best_move or (moves[0] if moves else None)
+
+    if cutoff and best_move is not None and not board.is_capture(best_move) \
+            and best_move.promotion is None:
+        slot = killers[ply] if ply < len(killers) else None
+        if slot is not None and best_move not in slot:
+            slot.insert(0, best_move)
+            del slot[2:]
+        if hist is not None:
+            hist[(best_move.from_square, best_move.to_square)] = \
+                hist.get((best_move.from_square, best_move.to_square), 0) + depth * depth
+
+    if key is not None and depth >= 1:
+        if cutoff:
+            flag = FLAG_LOWER if is_maximizing else FLAG_UPPER
+        else:
+            flag = FLAG_EXACT
+        _store_tt(key, depth, flag, _adj_store(best, ply), best_move)
+
+    return best
 
 
-def find_best_move(board, depth=3, nn_model=None):
-    \"\"\"Best move for the side to move via minimax + alpha-beta.
-    Pass nn_model to use neural-network leaf evaluation.\"\"\"
-    best_move = None
-    if board.turn == chess.WHITE:
-        best_value = -float('inf')
-    else:
-        best_value = float('inf')
-
+def _root_ordered(board, prev_move, use_tt):
+    \"\"\"Root move order: previous-iteration best move first, then the TT's
+    stored best move, then the ordered legal moves.\"\"\"
+    ordered = []
+    if prev_move is not None and prev_move in board.legal_moves:
+        ordered.append(prev_move)
+    if use_tt:
+        entry = _TT.get(zobrist_key(board))
+        if entry is not None and entry[3] is not None \
+                and entry[3] not in ordered and entry[3] in board.legal_moves:
+            ordered.append(entry[3])
     for move in order_moves(board):
-        board.push(move)
-        value = minimax(board, depth - 1, -float('inf'), float('inf'), board.turn, nn_model)
-        board.pop()
-        if board.turn == chess.WHITE and value > best_value:
-            best_value, best_move = value, move
-        elif board.turn == chess.BLACK and value < best_value:
-            best_value, best_move = value, move
+        if move not in ordered:
+            ordered.append(move)
+    return ordered
 
-    return best_move
-""")
+
+def find_best_move(board, depth=3, nn_model=None, time_limit=None):
+    \"\"\"Best move for the side to move via iterative-deepening minimax +
+    alpha-beta + a bounded transposition table (plus killers/history ordering).
+
+    Iterative deepening runs depth 1, 2, 3, ... up to the `depth` ceiling or
+    until `time_limit` seconds elapse (whichever comes first), reusing the
+    previous iteration's best move at the root so deeper searches start from
+    the strongest line. Returns the best move from the last fully completed
+    depth. If no depth completes (tiny budget), returns the first root move.\"\"\"
+    if board.is_game_over():
+        return None
+    legal = list(board.legal_moves)
+    if not legal:
+        return None
+    if depth < 1:
+        depth = 1
+
+    ctx = {"deadline": None, "killers": [[] for _ in range(depth + _MAX_QDEPTH + 4)],
+           "history": {}, "nodes": 0, "hit": False}
+    if time_limit is not None:
+        ctx["deadline"] = time.monotonic() + max(0.0, float(time_limit))
+
+    white = board.turn == chess.WHITE
+    use_tt = nn_model is None
+    best_move = legal[0]
+    prev_move = None
+    try:
+        for d in range(1, depth + 1):
+            root_moves = _root_ordered(board, prev_move, use_tt)
+            if white:
+                best = -MATE
+                found = None
+                for move in root_moves:
+                    if _time_up(ctx):
+                        raise _TimeUp()
+                    board.push(move)
+                    try:
+                        value = minimax(board, d - 1, -MATE, MATE, False,
+                                        nn_model, ctx, 1, use_tt)
+                    finally:
+                        board.pop()
+                    if found is None or value > best:
+                        best, found = value, move
+            else:
+                best = MATE
+                found = None
+                for move in root_moves:
+                    if _time_up(ctx):
+                        raise _TimeUp()
+                    board.push(move)
+                    try:
+                        value = minimax(board, d - 1, -MATE, MATE, True,
+                                        nn_model, ctx, 1, use_tt)
+                    finally:
+                        board.pop()
+                    if found is None or value < best:
+                        best, found = value, move
+            prev_move = found
+            if found is not None:
+                best_move = found
+    except _TimeUp:
+        pass
+
+    return best_move""")
+
 
 # --------------------------------------------------------------------------- #
 # Section 5.2 - Neural move selection
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 md("""### 5.2 Neural move selection (default)
 
 `play_nn` evaluates **all legal moves in a single batched call** to the model
@@ -695,7 +933,7 @@ def evaluate_positions(boards, model):
     return out['value'].cpu().numpy() * VALUE_SCALE
 
 
-def play_nn(fen, model, show_move_evaluations=False, player='b', use_minimax=False, depth=3, nn_leaf=False):
+def play_nn(fen, model, show_move_evaluations=False, player='b', use_minimax=False, depth=3, nn_leaf=False, time_limit=None):
     \"\"\"Pick the best move for the given FEN.
 
     Args:
@@ -703,14 +941,17 @@ def play_nn(fen, model, show_move_evaluations=False, player='b', use_minimax=Fal
         model: trained evaluation model
         player: 'b' (Black, minimize score) or 'w' (White, maximize score)
         use_minimax: if True, use minimax search instead of pure neural eval
-        depth: search depth when use_minimax=True
+        depth: search depth when use_minimax=True (max depth ceiling)
         nn_leaf: when True, minimax leaf positions are batched through the net
             (slower); when False, a fast PST + quiescence search is used.
+        time_limit: optional wall-clock budget (seconds) for iterative
+            deepening. None keeps the old fixed-depth behavior.
     \"\"\"
-    board = chess.Board(fen=fen)
+    board = chess.Board(fen)
 
     if use_minimax:
-        best = find_best_move(board, depth, nn_model=model if nn_leaf else None)
+        best = find_best_move(board, depth, nn_model=model if nn_leaf else None,
+                              time_limit=time_limit)
         if show_move_evaluations:
             print(f'Best move using Minimax: {best}')
         return str(best)
@@ -770,7 +1011,13 @@ md("""## 6. Playing the Bot
 Play a game against the neural bot. Type `quit` to end early.
 """)
 
-code("""from IPython.display import SVG, display
+code("""try:
+    from IPython.display import SVG, display
+except Exception:
+    SVG = lambda s: s
+    def display(*args, **kwargs):
+        for _a in args:
+            print(_a)
 
 # If running in plain Python (non-Jupyter), print text boards instead of SVG.
 try:

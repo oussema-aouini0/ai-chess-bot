@@ -5,10 +5,10 @@ code cells at runtime, so the CLI and notebook can never drift apart.
 
 Usage:
     python chess_bot.py train [--sample N] [--epochs N] [--batch N]
-    python chess_bot.py play [--human w|b] [--minimax] [--depth N]
-    python chess_bot.py rate [--games N] [--time S]
-    python chess_bot.py stockfish [--elo N] [--as-white] [--time S]
-    python chess_bot.py move <fen>
+    python chess_bot.py play [--human w|b] [--minimax] [--depth N] [--time S]
+    python chess_bot.py rate [--games N] [--time S] [--bot-time S]
+    python chess_bot.py stockfish [--elo N] [--as-white] [--time S] [--bot-time S]
+    python chess_bot.py move <fen> [--depth N] [--time S]
     python chess_bot.py eval <fen> [--top N]
 """
 
@@ -78,11 +78,11 @@ def require_model(ns):
     return ns["load_model_weights"](ns["MODEL_SAVE_PATH"])
 
 
-def make_bot(ns, model, use_minimax=True, depth=2, nn_leaf=False):
+def make_bot(ns, model, use_minimax=True, depth=2, nn_leaf=False, time_limit=None):
     def bot(fen, player="b"):
         return ns["play_nn"](fen, model, player=player,
                              use_minimax=use_minimax, depth=depth,
-                             nn_leaf=nn_leaf)
+                             nn_leaf=nn_leaf, time_limit=time_limit)
     return bot
 
 
@@ -130,9 +130,11 @@ def cmd_play(ns, args):
     if args.nn:
         ai = make_bot(ns, model, use_minimax=False)
     elif args.nnleaf:
-        ai = make_bot(ns, model, use_minimax=True, depth=args.depth, nn_leaf=True)
+        ai = make_bot(ns, model, use_minimax=True, depth=args.depth, nn_leaf=True,
+                      time_limit=args.time)
     else:
-        ai = make_bot(ns, model, use_minimax=True, depth=args.depth)
+        ai = make_bot(ns, model, use_minimax=True, depth=args.depth,
+                      time_limit=args.time)
     ns["play_game"](ai, human_player=args.human)
 
 
@@ -141,9 +143,11 @@ def cmd_rate(ns, args):
     if args.nn:
         bot = make_bot(ns, model, use_minimax=False)
     elif args.nnleaf:
-        bot = make_bot(ns, model, use_minimax=True, depth=args.depth, nn_leaf=True)
+        bot = make_bot(ns, model, use_minimax=True, depth=args.depth, nn_leaf=True,
+                       time_limit=args.bot_time)
     else:
-        bot = make_bot(ns, model, use_minimax=True, depth=args.depth)
+        bot = make_bot(ns, model, use_minimax=True, depth=args.depth,
+                       time_limit=args.bot_time)
     rating, summary = ns["rate_bot"](
         bot, num_games=args.games, time_limit=args.time)
     print(f"Final bot rating: {rating:.0f}")
@@ -154,9 +158,11 @@ def cmd_stockfish(ns, args):
     if args.nn:
         bot = make_bot(ns, model, use_minimax=False)
     elif args.nnleaf:
-        bot = make_bot(ns, model, use_minimax=True, depth=args.depth, nn_leaf=True)
+        bot = make_bot(ns, model, use_minimax=True, depth=args.depth, nn_leaf=True,
+                       time_limit=args.bot_time)
     else:
-        bot = make_bot(ns, model, use_minimax=True, depth=args.depth)
+        bot = make_bot(ns, model, use_minimax=True, depth=args.depth,
+                       time_limit=args.bot_time)
     result = ns["play_against_stockfish"](
         bot, bot_is_white=args.as_white,
         stockfish_elo=args.elo, time_limit=args.time)
@@ -171,10 +177,12 @@ def cmd_move(ns, args):
         move = ns["play_nn"](args.fen, model, player=player)
     elif args.nnleaf:
         move = ns["play_nn"](args.fen, model, player=player,
-                             use_minimax=True, depth=args.depth, nn_leaf=True)
+                             use_minimax=True, depth=args.depth, nn_leaf=True,
+                             time_limit=args.time)
     else:
         move = ns["play_nn"](args.fen, model, player=player,
-                             use_minimax=True, depth=args.depth)
+                             use_minimax=True, depth=args.depth,
+                             time_limit=args.time)
     print(move)
 
 
@@ -212,7 +220,10 @@ def main():
                     help="use pure neural evaluation (no search)")
     p_.add_argument("--nnleaf", action="store_true",
                     help="minimax with neural leaf eval (slow)")
-    p_.add_argument("--depth", type=int, default=2)
+    p_.add_argument("--depth", type=int, default=6,
+                    help="max search depth ceiling")
+    p_.add_argument("--time", type=float, default=3.0,
+                    help="seconds per bot move (iterative deepening)")
     p_.set_defaults(func=cmd_play)
 
     r = sub.add_parser("rate", help="estimate Elo by playing Stockfish")
@@ -220,11 +231,14 @@ def main():
                    help="games per Stockfish Elo level")
     r.add_argument("--time", type=float, default=0.1,
                    help="seconds per Stockfish move")
+    r.add_argument("--bot-time", type=float, default=3.0,
+                   help="seconds per bot move (iterative deepening)")
     r.add_argument("--nn", action="store_true",
                    help="use pure neural evaluation (no search)")
     r.add_argument("--nnleaf", action="store_true",
                    help="minimax with neural leaf eval (slow)")
-    r.add_argument("--depth", type=int, default=2)
+    r.add_argument("--depth", type=int, default=6,
+                   help="max search depth ceiling")
     r.set_defaults(func=cmd_rate)
 
     s = sub.add_parser("stockfish", help="one game bot vs Stockfish")
@@ -232,11 +246,14 @@ def main():
     s.add_argument("--as-white", action="store_true",
                    help="bot plays White")
     s.add_argument("--time", type=float, default=0.1)
+    s.add_argument("--bot-time", type=float, default=3.0,
+                   help="seconds per bot move (iterative deepening)")
     s.add_argument("--nn", action="store_true",
                    help="use pure neural evaluation (no search)")
     s.add_argument("--nnleaf", action="store_true",
                    help="minimax with neural leaf eval (slow)")
-    s.add_argument("--depth", type=int, default=2)
+    s.add_argument("--depth", type=int, default=6,
+                   help="max search depth ceiling")
     s.set_defaults(func=cmd_stockfish)
 
     m = sub.add_parser("move", help="best move for a FEN")
@@ -245,7 +262,10 @@ def main():
                    help="use pure neural evaluation (no search)")
     m.add_argument("--nnleaf", action="store_true",
                    help="minimax with neural leaf eval (slow)")
-    m.add_argument("--depth", type=int, default=2)
+    m.add_argument("--depth", type=int, default=6,
+                   help="max search depth ceiling")
+    m.add_argument("--time", type=float, default=3.0,
+                   help="seconds for search (iterative deepening)")
     m.set_defaults(func=cmd_move)
 
     e = sub.add_parser("eval", help="evaluate a FEN")
