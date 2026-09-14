@@ -846,6 +846,9 @@ def _root_ordered(board, prev_move, use_tt):
     return ordered
 
 
+_LAST_SEARCH = {"depth": 0, "nodes": 0}
+
+
 def find_best_move(board, depth=3, nn_model=None, time_limit=None):
     \"\"\"Best move for the side to move via iterative-deepening minimax +
     alpha-beta + a bounded transposition table (plus killers/history ordering).
@@ -906,8 +909,10 @@ def find_best_move(board, depth=3, nn_model=None, time_limit=None):
             prev_move = found
             if found is not None:
                 best_move = found
+            _LAST_SEARCH["depth"] = d
     except _TimeUp:
         pass
+    _LAST_SEARCH["nodes"] = ctx["nodes"]
 
     return best_move""")
 

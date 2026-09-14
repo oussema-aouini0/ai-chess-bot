@@ -12,6 +12,7 @@ Usage:
     python chess_bot.py eval <fen> [--top N]
     python chess_bot.py evaluate [--positions N] [--sf-depth N] [--blunder N]
                                  [--depth N] [--bot-time S] [--runs N] [--games N]
+                                 [--nn-leaf]
 """
 
 import argparse
@@ -135,9 +136,13 @@ def _sf_pool(ns, engine, board, depth=15, multipv=3):
     return best, top, best_cp
 
 
-def _bot_move(ns, model, fen, player, depth, time_limit, mode="search"):
-    return ns["play_nn"](fen, model, player=player, use_minimax=True,
-                         depth=depth, time_limit=time_limit)
+def _bot_move(ns, model, fen, player, depth, time_limit, mode="search", nn_leaf=False):
+    move = ns["play_nn"](fen, model, player=player, use_minimax=True,
+                         depth=depth, time_limit=time_limit, nn_leaf=nn_leaf)
+    stats = ns.get("_LAST_SEARCH")
+    depth_done = stats.get("depth") if stats else None
+    nodes = stats.get("nodes") if stats else None
+    return move, depth_done, nodes
 
 
 def _move_cp(ns, engine, board, move_uci, depth=15):
@@ -170,18 +175,25 @@ def _mate_loss(best_cp, bot_cp, bound=90000):
     return max(0.0, best_cp - bot_cp)
 
 
-def _accuracy_config(ns, engine, model, fens, args, depth, time_limit, label):
+def _accuracy_config(ns, engine, model, fens, args, depth, time_limit, label, nn_leaf=False):
     """Score one bot config across the position pool; returns metrics dict."""
     match = top3 = 0
     losses = []
+    depths = []
+    nodes = []
     for fen in fens:
         board = ns["chess"].Board(fen)
         if board.is_game_over():
             continue
         player = "w" if board.turn == ns["chess"].WHITE else "b"
-        bot_uci = _bot_move(ns, model, fen, player, depth, time_limit)
+        bot_uci, depth_done, node_count = _bot_move(
+            ns, model, fen, player, depth, time_limit, nn_leaf=nn_leaf)
         if not bot_uci:
             continue
+        if depth_done is not None:
+            depths.append(depth_done)
+        if node_count is not None:
+            nodes.append(node_count)
         best, top, _ = _sf_pool(ns, engine, board, args.sf_depth)
         best_cp = _move_cp(ns, engine, board, best, args.sf_depth)
         bot_cp = _move_cp(ns, engine, board, bot_uci, args.sf_depth)
@@ -201,12 +213,17 @@ def _accuracy_config(ns, engine, model, fens, args, depth, time_limit, label):
         "acpl": statistics.mean(losses) if n else 0.0,
         "blunder": 100.0 * blunders / n if n else 0.0,
         "blunder_threshold": args.blunder,
+        "avg_d": statistics.mean(depths) if depths else 0.0,
+        "min_d": min(depths) if depths else 0,
+        "max_d": max(depths) if depths else 0,
+        "depth_hist": {d: depths.count(d) for d in sorted(set(depths))},
+        "avg_nodes": statistics.mean(nodes) if nodes else 0.0,
     }
 
 
 def _elo_run(ns, model, args, run_idx):
     bot = make_bot(ns, model, use_minimax=True, depth=args.depth,
-                   time_limit=args.bot_time)
+                   time_limit=args.bot_time, nn_leaf=args.nn_leaf)
     rating, summary = ns["rate_bot"](bot, num_games=args.games,
                                      time_limit=args.time)
     return rating, summary
@@ -228,25 +245,31 @@ def cmd_evaluate(ns, args):
     engine = ns["get_stockfish_engine"](ns["STOCKFISH_PATH"])
     engine.configure({"Threads": 1, "Hash": 64})
 
+    leaf = "NN" if args.nn_leaf else "PST"
     bots = [
         {"label": f"old fixed-depth-2 ({args.depth_old})",
-         "depth": args.depth_old, "time": None},
-        {"label": f"new d{args.depth}/t{args.bot_time:g}s (CLI default)",
-         "depth": args.depth, "time": args.bot_time},
-        {"label": f"new d{args.depth_deep}/t{args.time_deep:g}s (deeper)",
-         "depth": args.depth_deep, "time": args.time_deep},
+         "depth": args.depth_old, "time": None, "leaf": False},
+        {"label": f"new d{args.depth}/t{args.bot_time:g}s {leaf}",
+         "depth": args.depth, "time": args.bot_time, "leaf": args.nn_leaf},
+        {"label": f"new d{args.depth_deep}/t{args.time_deep:g}s {leaf}",
+         "depth": args.depth_deep, "time": args.time_deep, "leaf": args.nn_leaf},
     ]
 
     print("\n=== Accuracy vs Stockfish " +
           f"(SF depth {args.sf_depth}, blunder>{args.blunder}cp) ===", flush=True)
-    header = f"{'config':42s} {'n':>4} {'match%':>7} {'top3%':>7} {'ACPL':>7} {'blunder%':>9}"
+    header = (f"{'config':42s} {'n':>4} {'match%':>7} {'top3%':>7} {'ACPL':>7} "
+              f"{'blunder%':>9} {'avgD':>5} {'dMin':>4} {'dMax':>4} {'nodes':>9}")
     print(header)
     print("-" * len(header))
     for bot in bots:
         m = _accuracy_config(ns, engine, model, fens, args,
-                             bot["depth"], bot["time"], bot["label"])
+                             bot["depth"], bot["time"], bot["label"],
+                             nn_leaf=bot["leaf"])
+        hist = " ".join(f"d{d}:{c}" for d, c in m["depth_hist"].items())
         print(f"{m['label']:42s} {m['n']:4d} {m['match']:6.1f}% {m['top3']:6.1f}% "
-              f"{m['acpl']:7.1f} {m['blunder']:8.1f}%", flush=True)
+              f"{m['acpl']:7.1f} {m['blunder']:8.1f}% {m['avg_d']:5.2f} "
+              f"{m['min_d']:4d} {m['max_d']:4d} {m['avg_nodes']:9.0f}", flush=True)
+        print(f"    depth dist: {hist}", flush=True)
 
     engine.quit()
 
@@ -264,7 +287,7 @@ def cmd_evaluate(ns, args):
             spread = f"mean {mean:.0f} +/- {sd:.0f}"
         else:
             spread = f"rating {ratings[0]:.0f}"
-        print(f"\nElo: {spread}  (CLI-default bot: depth {args.depth}, "
+        print(f"\nElo: {spread}  ({'NN' if args.nn_leaf else 'PST'}-leaf bot: depth {args.depth}, "
               f"{args.bot_time:g}s/move, SF {args.time:g}s/move)", flush=True)
 
     print(f"\nTotal evaluate time: {time.time() - t0:.0f}s", flush=True)
@@ -491,6 +514,9 @@ def main():
                     help="games per Stockfish Elo level per run")
     ev.add_argument("--time", type=float, default=0.1,
                     help="seconds per Stockfish move during Elo games")
+    ev.add_argument("--nn-leaf", action="store_true",
+                    help="use the neural net as leaf eval in search "
+                         "(TT disabled, slow)")
     ev.set_defaults(func=cmd_evaluate)
 
     args = p.parse_args()
