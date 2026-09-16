@@ -16,3 +16,9 @@ generate_bot_notebook.py
 chess_bot.i*pynb
 _tmp*.js
 _test_*.py
+
+# research artifacts not part of the deploy image
+chess_model_v2.pt
+train_v2.py
+docs/
+tools/

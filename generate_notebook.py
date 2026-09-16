@@ -674,18 +674,20 @@ def _store_tt(key, depth, flag, score, move):
         _TT.clear()
 
 
-def quiescence(board, alpha, beta, is_maximizing, ctx=None, ply=0, qdepth=_MAX_QDEPTH):
+def quiescence(board, alpha, beta, is_maximizing, ctx=None, ply=0, qdepth=_MAX_QDEPTH, nn_model=None):
     \"\"\"Search only captures at leaf nodes to reduce the horizon effect.
     Depth is capped (`qdepth`) and it never recurses into quiet moves, so a
-    capture chain stays bounded and cannot stall iterative deepening.\"\"\"
+    capture chain stays bounded and cannot stall iterative deepening.
+    `nn_model` selects the leaf evaluator (PST when None); both PST and NN
+    leaves run the same capture quiescence so they search identically.\"\"\"
     if ctx is None:
         ctx = {"deadline": None, "nodes": 0, "hit": False}
     if _time_up(ctx):
         raise _TimeUp()
     if qdepth <= 0 or board.is_game_over():
-        return _leaf_eval(board, ply=ply)
+        return _leaf_eval(board, nn_model, ply)
 
-    stand_pat = _leaf_eval(board, ply=ply)
+    stand_pat = _leaf_eval(board, nn_model, ply)
     if is_maximizing:
         if stand_pat >= beta:
             return beta
@@ -720,9 +722,8 @@ def minimax(board, depth, alpha, beta, is_maximizing, nn_model=None,
             ctx=None, ply=0, use_tt=True):
     \"\"\"Alpha-beta minimax with a transposition table, killer moves and a
     history heuristic. With nn_model, leaf positions are scored by the neural
-    net in one batched forward pass (no quiescence, and the TT is disabled
-    so PST and NN scores never mix). Without it, quiescence search is used
-    with PST evaluation.\"\"\"
+    net through the same capture quiescence PST uses (the TT is disabled so
+    PST and NN scores never mix).\"\"\"
     if _time_up(ctx):
         raise _TimeUp()
     if board.is_game_over():
@@ -745,19 +746,8 @@ def minimax(board, depth, alpha, beta, is_maximizing, nn_model=None,
                     return cached
 
     if depth == 0:
-        if nn_model is None:
-            return quiescence(board, alpha, beta, is_maximizing, ctx, ply)
-        child_boards = []
-        for move in order_moves(board):
-            if _time_up(ctx):
-                raise _TimeUp()
-            board.push(move)
-            child_boards.append(board.copy())
-            board.pop()
-        scores = -evaluate_positions(child_boards, nn_model)  # White POV
-        if is_maximizing:
-            return float(max(scores))
-        return float(min(scores))
+        return quiescence(board, alpha, beta, is_maximizing, ctx, ply,
+                          nn_model=nn_model)
 
     killers = (ctx or {}).get("killers", [])
     hist = (ctx or {}).get("history", {})
@@ -947,8 +937,9 @@ def play_nn(fen, model, show_move_evaluations=False, player='b', use_minimax=Fal
         player: 'b' (Black, minimize score) or 'w' (White, maximize score)
         use_minimax: if True, use minimax search instead of pure neural eval
         depth: search depth when use_minimax=True (max depth ceiling)
-        nn_leaf: when True, minimax leaf positions are batched through the net
-            (slower); when False, a fast PST + quiescence search is used.
+        nn_leaf: when True, minimax leaf positions are evaluated by the
+            neural net (slower); when False, a fast PST + quiescence search
+            is used. Both leaf types run the same capture quiescence.
         time_limit: optional wall-clock budget (seconds) for iterative
             deepening. None keeps the old fixed-depth behavior.
     \"\"\"
