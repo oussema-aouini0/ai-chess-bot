@@ -473,7 +473,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Chess Bot</title>
+<title> Watcha Chess Bot </title>
 <link rel="icon" href="data:,">
 <style>
   :root, [data-theme="dark"] {
@@ -627,7 +627,7 @@ INDEX_HTML = r"""<!doctype html>
 <body data-skin="brown">
 <div class="wrap">
   <header>
-    <h1>♞ AI Chess Bot</h1>
+    <h1>♞ Watcha </h1>
     <div class="spacer"></div>
     <button class="iconbtn" id="btn-eval" title="Eval bar on/off">📊</button>
     <button class="iconbtn" id="btn-sound" title="Sound on/off">🔇</button>
