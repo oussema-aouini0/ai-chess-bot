@@ -73,6 +73,30 @@ Every `git push` to the repo re-deploys automatically.
 - **Custom domain**: Render Dashboard → service → *Settings* → *Custom Domains*
   (free TLS).
 
+## 4. (Optional) Arcade leaderboard — Neon Postgres
+
+The board itself needs nothing extra, but the "Save score / Leaderboard" tab
+needs a Postgres connection. Free options: **Neon** (~0.5 GB) or
+**Supabase** (~0.5 GB), both $0.
+
+1. Create a free **Neon** project → **Connect** → copy the connection string
+   (the `postgres://...` one, not the pooled `-pooler` variant).
+2. Render Dashboard → your **chess-bot** service → **Settings → Environment**
+   → **Add Environment Variable**: `DATABASE_URL` = that string → **Save** →
+   **Deploy latest commit**.
+3. The table (`leaderboard`) is created automatically on first request.
+
+Behavior with no variable set:
+
+- `/healthz` still returns `ok`; the whole app works.
+- The Leaderboard tab shows *"Leaderboard unavailable"*; saving a score after
+  a game is not offered.
+
+Rules (no-auth, arcade): a win scores `100 × mode/depth multiplier`, a draw
+`30 × multiplier`, a loss `0` — then adds a streak bonus of `+10` per
+consecutive win, capped at `+100`. Multipliers: Search (Easy 1.0 / Normal 1.5
+/ Hard 2.0), Neural 1.0, NN-leaf (d1 1.5 / d2 1.8 / d3 2.2).
+
 ## Local check before pushing
 
 Simulate the production WSGI flow on Windows (waitress = same gunicorn-style

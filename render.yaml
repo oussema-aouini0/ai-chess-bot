@@ -15,3 +15,8 @@ services:
         value: "4"
       - key: TORCH_THREADS
         value: "2"
+      # Optional arcade leaderboard: set this to a Neon/Supabase Postgres
+      # connection string (Settings -> Environment in the Render dashboard).
+      # Without it the app runs fully and the leaderboard hides itself.
+      - key: DATABASE_URL
+        sync: false
