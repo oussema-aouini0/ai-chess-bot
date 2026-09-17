@@ -6,8 +6,9 @@ depth, time budget and model are shared with the CLI and the notebooks.
 Features:
 - Visual polish: light/dark themes, board skins, check highlight, captured
   pieces, material delta, animations, optional sounds.
-- Gameplay: difficulty presets, per-side clocks (with increment), undo,
-  resume via localStorage, coach (hint + eval bar), PGN export.
+- Gameplay: difficulty presets (depth ceiling + wall-clock budget per preset),
+  per-side clocks (with increment), undo, resume via localStorage, coach
+  (hint + eval bar), PGN export.
 - No-auth arcade leaderboard backed by an optional Postgres (DATABASE_URL).
   Without it (or without psycopg2) the app runs fully; the leaderboard just
   reports itself unavailable.
@@ -59,6 +60,22 @@ MODES = {"search", "nn", "nnleaf"}
 AI_SEM = threading.Semaphore(MAX_CONCURRENT)
 
 
+def _time_for_depth(depth):
+    """Wall-clock budget (seconds) for a minimax search at a given depth.
+
+    Difficulty controls the *ceiling* via depth; the wall-clock budget is the
+    real lever. On the free tier's 0.1 CPU an uncapped depth-3 search measured
+    58s on a dev machine (worse on Render), which would stall a request past
+    the 60s gunicorn timeout. Time caps overridable per difficulty via
+    TIME_EASY / TIME_NORMAL / TIME_HARD.
+    """
+    if int(depth) <= 1:
+        return float(os.environ.get("TIME_EASY", "1.0"))
+    if int(depth) == 2:
+        return float(os.environ.get("TIME_NORMAL", "2.5"))
+    return float(os.environ.get("TIME_HARD", "6.0"))
+
+
 # --------------------------------------------------------------------------- #
 # Leaderboard (no-auth, arcade style)                                         #
 # --------------------------------------------------------------------------- #
@@ -66,6 +83,13 @@ DB_URL = os.environ.get("DATABASE_URL", "").strip()
 _db_conn = None
 _db_lock = threading.Lock()
 _lb_cache = {"t": 0.0, "data": None}
+
+# Trivial per-IP throttle for score submissions. No-auth arcade mode is an
+# accepted trust tradeoff; this just stops a single client flooding the board.
+_rl_lock = threading.Lock()
+_score_hits = {}
+SCORE_RATE = int(os.environ.get("SCORE_RATE", "10"))
+SCORE_WINDOW = 60.0
 
 LEADERBOARD_BASE = {"win": 100, "draw": 30, "loss": 0}
 LEADERBOARD_MULT = {
@@ -83,6 +107,27 @@ def _score_pts(result, mode, depth, streak):
     m = LEADERBOARD_MULT.get(mode, {})
     mult = m.get(depth, 1.0) if isinstance(m, dict) else float(m)
     return int(round(base * mult)) + min(streak * STREAK_BONUS, STREAK_CAP)
+
+
+def _score_ip():
+    fwd = request.headers.get("X-Forwarded-For", "") or request.remote_addr or ""
+    return fwd.split(",")[0].strip() or "unknown"
+
+
+def _score_limited():
+    """True if this client has already posted SCORE_RATE scores in the window."""
+    ip = _score_ip()
+    now = _time.monotonic()
+    with _rl_lock:
+        hits = [t for t in _score_hits.get(ip, []) if now - t < SCORE_WINDOW]
+        if len(hits) >= SCORE_RATE:
+            _score_hits[ip] = hits
+            return True
+        hits.append(now)
+        _score_hits[ip] = hits
+        if len(_score_hits) > 8192:
+            _score_hits.clear()
+        return False
 
 
 def _db():
@@ -167,20 +212,21 @@ def _get_model():
     return MODEL
 
 
-def _bot_factory(mode, depth):
+def _bot_factory(mode, depth, time_limit=None):
     model = _get_model()
     if mode == "nn":
         return chess_bot.make_bot(NS, model, use_minimax=False)
     if mode == "nnleaf":
         return chess_bot.make_bot(NS, model, use_minimax=True,
-                                  depth=depth, nn_leaf=True)
-    return chess_bot.make_bot(NS, model, use_minimax=True, depth=depth)
+                                  depth=depth, nn_leaf=True, time_limit=time_limit)
+    return chess_bot.make_bot(NS, model, use_minimax=True, depth=depth,
+                              time_limit=time_limit)
 
 
-def _ai_move(board, mode, depth):
+def _ai_move(board, mode, depth, time_limit=None):
     fen = board.fen()
     player = "w" if board.turn == chess.WHITE else "b"
-    bot = _bot_factory(mode, depth)
+    bot = _bot_factory(mode, depth, time_limit)
     with AI_SEM:  # cap simultaneous CPU searches across players
         return bot(fen, player)
 
@@ -324,7 +370,7 @@ def hint():
         player = "w" if board.turn == chess.WHITE else "b"
         move = NS["play_nn"](board.fen(), None, player=player,
                              use_minimax=True, depth=depth,
-                             time_limit=None, nn_leaf=False)
+                             time_limit=_time_for_depth(depth), nn_leaf=False)
     cp = float(NS["evaluate_board"](board, None))
     if move:
         m = chess.Move.from_uci(move)
@@ -340,7 +386,7 @@ def new_game():
             "bot_move": None, "bot_san": None, "status": "Your turn"}
     if side != "w":
         b = chess.Board(START_FEN)
-        bot_uci = _ai_move(b, mode, depth)
+        bot_uci = _ai_move(b, mode, depth, _time_for_depth(depth))
         m = chess.Move.from_uci(bot_uci)
         san = b.san(m)
         b.push(m)
@@ -415,7 +461,7 @@ def make_move():
         return jsonify(resp)
 
     # bot replies
-    bot_uci = _ai_move(board, mode, depth)
+    bot_uci = _ai_move(board, mode, depth, _time_for_depth(depth))
     bot_mv = chess.Move.from_uci(bot_uci)
     san_bot = board.san(bot_mv)
     board.push(bot_mv)
@@ -439,6 +485,8 @@ def leaderboard():
 
 @app.route("/api/score", methods=["POST"])
 def add_score():
+    if _score_limited():
+        return jsonify({"ok": False, "reason": "rate_limited"}), 429
     body = request.get_json(force=True)
     conn = _db()
     if conn is None:
@@ -627,7 +675,7 @@ INDEX_HTML = r"""<!doctype html>
 <body data-skin="brown">
 <div class="wrap">
   <header>
-    <h1>♞ Watcha </h1>
+    <h1>♞ Watcha AI </h1>
     <div class="spacer"></div>
     <button class="iconbtn" id="btn-eval" title="Eval bar on/off">📊</button>
     <button class="iconbtn" id="btn-sound" title="Sound on/off">🔇</button>
