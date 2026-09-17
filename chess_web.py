@@ -83,6 +83,8 @@ DB_URL = os.environ.get("DATABASE_URL", "").strip()
 _db_conn = None
 _db_lock = threading.Lock()
 _lb_cache = {"t": 0.0, "data": None}
+_db_error = None  # last diagnostics for why the leaderboard is unavailable
+DB_CONNECT_TIMEOUT = int(os.environ.get("DB_CONNECT_TIMEOUT", "15"))
 
 # Trivial per-IP throttle for score submissions. No-auth arcade mode is an
 # accepted trust tradeoff; this just stops a single client flooding the board.
@@ -131,14 +133,24 @@ def _score_limited():
 
 
 def _db():
-    """Return a working connection or None (unavailable: no URL / no driver)."""
-    global _db_conn
-    if not DB_URL or not _PSYCOPG2:
+    """Return a working connection or None (unavailable: no URL / no driver).
+
+    Sets `_db_error` to a short human-readable reason so health/leaderboard
+    responses can report WHY the leaderboard is unavailable (missing env var,
+    missing driver, or the actual psycopg2 error) instead of collapsing all
+    three into a silent None.
+    """
+    global _db_conn, _db_error
+    if not DB_URL:
+        _db_error = "no DATABASE_URL env"
+        return None
+    if not _PSYCOPG2:
+        _db_error = "psycopg2 not installed"
         return None
     with _db_lock:
         try:
             if _db_conn is None or _db_conn.closed:
-                _db_conn = psycopg2.connect(DB_URL, connect_timeout=5)
+                _db_conn = psycopg2.connect(DB_URL, connect_timeout=DB_CONNECT_TIMEOUT)
                 _db_conn.autocommit = True
                 with _db_conn.cursor() as cur:
                     cur.execute("""
@@ -152,14 +164,16 @@ def _db():
                             streak INTEGER NOT NULL DEFAULT 0,
                             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                         )""")
+            _db_error = None
             return _db_conn
-        except Exception:
+        except Exception as exc:
             try:
                 if _db_conn is not None:
                     _db_conn.close()
             except Exception:
                 pass
             _db_conn = None
+            _db_error = f"{type(exc).__name__}: {exc}"[:200]
             return None
 
 
@@ -175,7 +189,7 @@ def _leaderboard_data(force=False):
         return cached
     conn = _db()
     if conn is None:
-        return {"available": False}
+        return {"available": False, "reason": _db_error or "unavailable"} 
     try:
         with _db_lock:
             with conn.cursor() as cur:
@@ -343,7 +357,11 @@ def legal():
 
 @app.route("/healthz")
 def health():
-    return ("ok", 200)
+    # Keep the probe 200 regardless: subtractive statuses must never fail the
+    # liveness check. Report leaderboard state so ops can see it in one call.
+    lb = {"available": True} if _db() is not None else \
+        {"available": False, "reason": _db_error or "unavailable"}
+    return jsonify({"ok": True, "leaderboard": lb})
 
 
 @app.route("/api/eval")
@@ -490,7 +508,8 @@ def add_score():
     body = request.get_json(force=True)
     conn = _db()
     if conn is None:
-        return jsonify({"ok": False, "available": False}), 503
+        return jsonify({"ok": False, "available": False,
+                        "reason": _db_error or "unavailable"}), 503
     name = _clean_name(body.get("name"))
     result = str(body.get("result", "draw")).strip()
     if result not in ("win", "draw", "loss"):
