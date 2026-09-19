@@ -59,6 +59,19 @@ MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "4"))
 MODES = {"search", "nn", "nnleaf"}
 AI_SEM = threading.Semaphore(MAX_CONCURRENT)
 
+# Post-game review: PST+quiescence only (never nn_leaf), a per-move wall-clock
+# budget derived from a total review budget so even a long game's review stays
+# well under the 60s gunicorn timeout. Depth is just a ceiling, budget is the
+# lever — the same trade the live move path uses.
+REVIEW_TOTAL = float(os.environ.get("REVIEW_TOTAL", "20"))
+REVIEW_MIN_PER_MOVE = float(os.environ.get("REVIEW_MIN_PER_MOVE", "0.25"))
+REVIEW_MAX_PER_MOVE = float(os.environ.get("REVIEW_MAX_PER_MOVE", "3.0"))
+REVIEW_DEPTH = int(os.environ.get("REVIEW_DEPTH", "3"))
+REVIEW_MAX_MOVES = int(os.environ.get("REVIEW_MAX_MOVES", "150"))
+# Loss brackets (cp), anchored to the evaluate CLI's `--blunder` default (100):
+#   0            -> best;  1..24  -> good;  25..49 -> inaccuracy;
+#   50..100      -> mistake;  >100 -> blunder (matches loss > args.blunder).
+
 
 def _time_for_depth(depth):
     """Wall-clock budget (seconds) for a minimax search at a given depth.
@@ -74,6 +87,43 @@ def _time_for_depth(depth):
     if int(depth) == 2:
         return float(os.environ.get("TIME_NORMAL", "2.5"))
     return float(os.environ.get("TIME_HARD", "6.0"))
+
+
+REVIEW_THRESHOLDS = {
+    "best": 0, "good": 25, "inaccuracy": 50, "mistake": 100, "blunder": 100,
+    "note": "loss cp brackets: best 0; good 1-24; inaccuracy 25-49; "
+            "mistake 50-100; blunder >100 (= evaluate CLI --blunder default)",
+}
+
+
+def _rnd1(x):
+    return int(round(x)) if x is not None else None
+
+
+def _rnd2(x):
+    return round(x, 2) if x is not None else None
+
+
+def _review_label(loss):
+    """Classify a centipawn loss into Best/Good/Inaccuracy/Mistake/Blunder."""
+    if loss is None:
+        return None
+    if loss <= REVIEW_THRESHOLDS["best"]:
+        return "best"
+    if loss < REVIEW_THRESHOLDS["good"]:
+        return "good"
+    if loss < REVIEW_THRESHOLDS["inaccuracy"]:
+        return "inaccuracy"
+    if loss <= REVIEW_THRESHOLDS["mistake"]:
+        return "mistake"
+    return "blunder"
+
+
+def _review_accuracy(acpl):
+    """Accuracy 0-100 from average centipawn loss (CPL): every 2cp of ACPL
+    costs 1 accuracy point, floored at 0 for ACPL >= 200. Not chess.com's
+    exact formula — a simple documented monotonic mapping from ACPL."""
+    return max(0, min(100, int(round(100 * (1 - min(acpl, 200.0) / 200.0)))))
 
 
 # --------------------------------------------------------------------------- #
@@ -397,6 +447,112 @@ def hint():
     return jsonify({"move": None, "san": None, "cp": cp})
 
 
+@app.route("/api/review", methods=["POST"])
+def review():
+    """Post-game review of a finished move list (SAN, chronological).
+
+    Reuses the exact centipawn-loss math from the evaluate CLI (_mate_loss),
+    but with the bot's own PST+QS evaluator as the reference instead of
+    Stockfish — the same evaluator the player saw live in the hint/eval bar,
+    never nn_leaf (slower AND weaker, per the earlier investigation). Per-move
+    best-move searches share AI_SEM and get a wall-clock budget derived from
+    REVIEW_TOTAL so the whole request stays far under the 60s server timeout.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    sans = body.get("sans") or body.get("moves") or []
+    if not isinstance(sans, list) or not sans:
+        return jsonify({"ok": False, "reason": "no moves"}), 400
+    clean = [str(s).strip() for s in sans if str(s).strip()]
+    if len(clean) > REVIEW_MAX_MOVES:
+        return jsonify({"ok": False,
+                        "reason": f"too many plies (> {REVIEW_MAX_MOVES})"}), 400
+
+    board = chess.Board()
+    parsed = []
+    for i, san in enumerate(clean):
+        try:
+            parsed.append(board.parse_san(san))
+        except ValueError:
+            return jsonify({"ok": False,
+                            "reason": f"invalid move at ply {i + 1}: {san}"}), 400
+        board.push(parsed[-1])
+
+    n = len(parsed)
+    per_move = max(REVIEW_MIN_PER_MOVE,
+                   min(REVIEW_MAX_PER_MOVE, REVIEW_TOTAL / n))
+
+    with AI_SEM:
+        t0 = _time.monotonic()
+        board = chess.Board()
+        graph = [{"p": 0,
+                  "cp": int(round(float(NS["evaluate_board"](board, None))))}]
+        rows = []
+        losses_by = {"w": [], "b": []}
+        for idx, mv in enumerate(parsed):
+            ply = idx + 1
+            white_turn = board.turn == chess.WHITE
+            color = "w" if white_turn else "b"
+            cp_before = graph[-1]["cp"]
+            best_uci = None
+            loss = None
+            if not board.is_game_over():
+                player = "w" if white_turn else "b"
+                best_uci = NS["play_nn"](board.fen(), None, player=player,
+                                         use_minimax=True, depth=REVIEW_DEPTH,
+                                         time_limit=per_move, nn_leaf=False)
+                if best_uci and best_uci != "None":
+                    bb = board.copy()
+                    bb.push(chess.Move.from_uci(best_uci))
+                    bcwp = float(NS["evaluate_board"](bb, None))
+                    ba = board.copy()
+                    ba.push(mv)
+                    acwp = float(NS["evaluate_board"](ba, None))
+                    best_pov = bcwp if white_turn else -bcwp
+                    actual_pov = acwp if white_turn else -acwp
+                    loss = chess_bot._mate_loss(best_pov, actual_pov)
+            board.push(mv)
+            cp_after = int(round(float(NS["evaluate_board"](board, None))))
+            if loss is not None:
+                losses_by[color].append(loss)
+            graph.append({"p": ply, "cp": cp_after})
+            rows.append({
+                "p": ply, "c": color, "san": clean[idx], "uci": mv.uci(),
+                "best": best_uci, "loss": _rnd1(loss), "label": _review_label(loss),
+                "cp": cp_after, "gain": abs(cp_after - cp_before),
+            })
+        elapsed = _time.monotonic() - t0
+
+    scored = [r for r in rows if r["loss"] is not None]
+    best_h = blunder_h = None
+    if scored:
+        best_h = min(scored, key=lambda r: (r["loss"], -r["gain"]))
+        blunder_h = max(scored, key=lambda r: r["loss"])
+    acpl = {k: _rnd1(sum(v) / len(v)) if v else 0.0 for k, v in losses_by.items()}
+    accuracy = {k: _review_accuracy(float(acpl[k])) for k in ("w", "b")}
+
+    return jsonify({
+        "ok": True,
+        "evaluator": "pst+qs",
+        "nn_leaf": False,
+        "depth_ceiling": REVIEW_DEPTH,
+        "per_move_budget": _rnd2(per_move),
+        "time_budget_total": _rnd2(REVIEW_TOTAL),
+        "thresholds": REVIEW_THRESHOLDS,
+        "graph": graph,
+        "moves": rows,
+        "acpl": acpl,
+        "accuracy": accuracy,
+        "highlights": {
+            "best": {"p": best_h["p"], "san": best_h["san"],
+                     "loss": best_h["loss"], "label": best_h["label"]} if best_h else None,
+            "blunder": {"p": blunder_h["p"], "san": blunder_h["san"],
+                        "loss": blunder_h["loss"],
+                        "label": blunder_h["label"]} if blunder_h else None,
+        },
+        "elapsed_s": _rnd2(elapsed),
+    })
+
+
 @app.route("/api/new_game")
 def new_game():
     mode, depth, side = _clamp(request.args)
@@ -592,15 +748,34 @@ INDEX_HTML = r"""<!doctype html>
   .cell.selected { box-shadow:inset 0 0 0 4px var(--sel); }
   .cell.last-from, .cell.last-to { box-shadow:inset 0 0 0 4px var(--sel); }
   .cell.in-check img { filter:drop-shadow(0 0 6px var(--check)); }
-  .cell img { width:92%; height:92%; pointer-events:none; object-fit:contain; }
+  .cell img { width:92%; height:92%; pointer-events:none; object-fit:contain; will-change:transform; }
+  .cell img.slide { animation: piece-slide .18s ease-out; position:relative; z-index:2; }
+  @keyframes piece-slide {
+    from { transform: translate(var(--dx, 0), var(--dy, 0)); }
+    to   { transform: translate(0, 0); }
+  }
+  .cell.cap { animation: cap-flash .28s ease-out; }
+  @keyframes cap-flash {
+    0%   { box-shadow: inset 0 0 0 3px var(--lose); }
+    100% { box-shadow: inset 0 0 0 3px transparent; }
+  }
+  .cell.checkpulse { animation: check-pulse .55s ease-in-out .08s 2; }
+  @keyframes check-pulse {
+    0%, 100% { box-shadow: inset 0 0 0 4px transparent; }
+    50%      { box-shadow: inset 0 0 0 4px var(--check); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cell img.slide, .cell.cap, .cell.checkpulse { animation: none !important; }
+  }
   .coord { position:absolute; font-size:9px; opacity:.55; pointer-events:none; }
   .coord.file { bottom:1px; right:2px; }
   .coord.rank { top:1px; left:2px; }
   #hint-layer { position:absolute; inset:0; pointer-events:none; z-index:3; }
   #thinking { position:absolute; inset:0; display:none; align-items:center;
           justify-content:center; background:rgba(0,0,0,.5); z-index:4;
-          border-radius:4px; font-size:16px; font-weight:600; letter-spacing:.5px;
-          text-align:center; padding:8px; }
+          border-radius:4px; }
+  #thinking .spinner { width:32px; height:32px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   #evalwrap { flex:0 0 18px; border:2px solid var(--b-border); border-radius:6px;
           overflow:hidden; position:relative; background:#444; }
   #evalbar { position:absolute; bottom:0; left:0; right:0; background:var(--b-light);
@@ -661,13 +836,42 @@ INDEX_HTML = r"""<!doctype html>
   #modal.open { display:flex; }
   #modal-box { background:var(--panel); border-radius:12px; padding:20px 22px;
                max-width:340px; width:100%; box-shadow:0 14px 40px var(--shadow);
-               text-align:center; }
+               text-align:center; max-height:88vh; overflow-y:auto; }
+  #modal-box.wide { max-width:560px; text-align:left; }
   #modal-box h3 { margin:0 0 6px; font-size:20px; }
   #modal-box .result { font-size:14px; color:var(--sub); margin-bottom:14px; word-break:break-word; }
   #modal-box .actions { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
   #modal-box input { width:100%; margin:8px 0; padding:7px; text-align:center;
           border:1px solid var(--border); border-radius:7px; background:var(--panel2); color:var(--txt); }
   #modal-box .saveq { font-size:12px; opacity:.8; margin-top:4px; }
+  #btn-review { display:none; }
+
+  #review { display:none; margin-top:14px; border-top:1px solid var(--border); padding-top:12px; }
+  #review.open { display:block; }
+  #review h4 { margin:0 0 4px; font-size:15px; }
+  #review .rv-note { font-size:11px; color:var(--sub); font-weight:400; }
+  #rv-body { font-size:12.5px; }
+  .rv-acc { display:flex; gap:10px; margin:8px 0 10px; flex-wrap:wrap; }
+  .rv-acc .chip { flex:1; min-width:130px; background:var(--panel2); border:1px solid var(--border);
+                  border-radius:8px; padding:7px 12px; }
+  .rv-acc .chip b { display:block; font-size:20px; line-height:1.1; }
+  .rv-acc .chip span { font-size:11px; color:var(--sub); }
+  .rv-hl { font-size:12.5px; line-height:1.55; margin:6px 0 10px; color:var(--sub); }
+  .rv-hl b { color:var(--txt); }
+  #rv-graph { width:100%; height:130px; display:block; margin:4px 0 8px; background:var(--panel2);
+              border:1px solid var(--border); border-radius:8px; }
+  .rv-grade { font-size:10.5px; font-weight:700; padding:1px 6px; border-radius:5px;
+              letter-spacing:.03em; text-transform:capitalize; }
+  .rv-grade.best { background:rgba(125,255,107,.16); color:var(--win); }
+  .rv-grade.good { background:rgba(255,215,94,.12); color:var(--draw); }
+  .rv-grade.inaccuracy { background:rgba(255,215,94,.22); color:var(--draw); }
+  .rv-grade.mistake { background:rgba(255,154,80,.22); color:#ffbd80; }
+  .rv-grade.blunder { background:rgba(255,95,86,.22); color:var(--lose); }
+  #rv-table-wrap { max-height:230px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+  table.rv { width:100%; border-collapse:collapse; font-size:12px; }
+  table.rv th, table.rv td { padding:3px 7px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
+  table.rv th { color:var(--sub); font-weight:600; font-size:10.5px;
+                position:sticky; top:0; background:var(--panel2); }
 
   #resume-bar { position:fixed; left:50%; top:12px; transform:translateX(-50%);
                 background:var(--accent); color:#1e1c1b; font-weight:600;
@@ -711,7 +915,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="board-wrap">
       <div id="board"></div>
       <svg id="hint-layer"></svg>
-      <div id="thinking">AI is thinking…</div>
+      <div id="thinking"><div class="spinner"></div></div>
     </div>
   </div>
 
@@ -784,9 +988,11 @@ INDEX_HTML = r"""<!doctype html>
   <div class="actions">
     <button onclick="newGame()">Rematch</button>
     <button onclick="copyPGN()">Copy PGN</button>
+    <button id="btn-review" onclick="toggleReview()">Review game</button>
     <button onclick="closeModal()">Close</button>
   </div>
   <div class="saveq" id="m-save"></div>
+  <div id="review"><h4>Game review <span class="rv-note">PST &amp; quiescence</span></h4><div id="rv-body"></div></div>
 </div></div>
 
 <div id="promo"><div id="promo-box"></div></div>
@@ -805,6 +1011,7 @@ let state = {
   thinking: false, selected: null, targets: [],
   humanMs: 0, botMs: 0, clockTurn: 'w',
   hint: null,
+  fx: null,
 };
 const settings = {
   theme: localStorage.getItem('cs_theme') || 'dark',
@@ -968,6 +1175,7 @@ function isKingAttacked(map, kingSq, attackerColor) {
 }
 
 function render() {
+  const fx = state.fx; state.fx = null;
   const layout = cellSquares();
   const box = $('board'); box.innerHTML = '';
   for (let r = 0; r < 8; r++) {
@@ -996,9 +1204,30 @@ function render() {
     const c = $('sq-' + squareName(P.kings[P.turn]));
     if (c) c.classList.add('in-check');
   }
+  if (fx && fx.to && fx.to !== fx.from) {
+    if (fx.slide !== false) animateSlide(fx);
+    if (fx.capture) { const cap = $('sq-' + fx.to); if (cap) cap.classList.add('cap'); }
+    if (P.inCheck && P.kings[P.turn] !== undefined) {
+      const c = $('sq-' + squareName(P.kings[P.turn]));
+      if (c) c.classList.add('checkpulse');
+    }
+  }
   renderCaptured(P);
   renderEval();
   drawHint();
+}
+function animateSlide(fx) {
+  const cell = $('sq-' + fx.to);
+  if (!cell) return;
+  const img = cell.querySelector('img');
+  if (!img) return;
+  const layout = cellSquares();
+  const fi = layout.indexOf(fx.from), ti = layout.indexOf(fx.to);
+  if (fi < 0 || ti < 0) return;
+  const px = cellPx();
+  img.style.setProperty('--dx', ((fi % 8) - (ti % 8)) * px + 'px');
+  img.style.setProperty('--dy', (Math.floor(fi / 8) - Math.floor(ti / 8)) * px + 'px');
+  img.classList.add('slide');
 }
 function coord(cls, text) {
   const s = el('span', 'coord ' + cls);
@@ -1116,7 +1345,7 @@ window.addEventListener('mouseup', e => {
   const { from, clone } = drag; drag = null; clone.remove();
   const cell = e.target.closest ? e.target.closest('.cell') : null;
   const to = cell && cell.dataset.square;
-  if (to && to !== from) sendMove(from, to);
+  if (to && to !== from) sendMove(from, to, 'drag');
 });
 
 function isUserPiece(pc) {
@@ -1129,7 +1358,7 @@ async function clickCell(sq) {
   if (state.thinking || state.over) return;
   if (state.selected) {
     if (sq === state.selected) { clearSel(); return; }
-    if (state.targets.includes(sq)) { sendMove(state.selected, sq); return; }
+    if (state.targets.includes(sq)) { sendMove(state.selected, sq, 'click'); return; }
   }
   const pc = pieceAt(sq);
   if (!pc || !isUserPiece(pc)) { clearSel(); return; }
@@ -1244,8 +1473,9 @@ function newGame() {
   state.moves = []; state.sanSeq = []; state.checkpoints = [];
   state.last = null; state.over = false; state.result = null;
   state.selected = null; state.targets = [];
-  state.fen = START_FEN;
+  state.fen = START_FEN; state.fx = null;
   state.clockTurn = state.myColor;
+  rvCache.clear(); closeReview();
   clearMovesList(); closeModal(); saveSettings();
   render(); renderClocks();
   const humanFirst = state.myColor === 'w';
@@ -1259,6 +1489,8 @@ function newGame() {
       .then(d => {
         state.last = d.bot_move ? { from: d.bot_move.slice(0, 2), to: d.bot_move.slice(2, 4) } : null;
         state.fen = d.fen;
+        state.fx = d.bot_move ? { from: d.bot_move.slice(0, 2), to: d.bot_move.slice(2, 4),
+                                  slide: true, capture: (d.bot_san || '').indexOf('x') >= 0 } : null;
         state.sanSeq.push(d.bot_san || d.bot_move);
         state.checkpoints.push({ fen: START_FEN, what: 'bot-first', sanH: null, sanB: d.bot_san });
         state.clockTurn = state.myColor;
@@ -1273,7 +1505,7 @@ function newGame() {
   }
 }
 
-async function sendMove(from, to) {
+async function sendMove(from, to, via) {
   if (state.thinking || state.over) return;
   const pc = pieceAt(from);
   let uci = from + to;
@@ -1313,6 +1545,18 @@ async function sendMove(from, to) {
     state.last = data.bot_move ? { from: data.bot_move.slice(0, 2), to: data.bot_move.slice(2, 4) }
                                : { from, to };
     state.fen = data.fen;
+    // Animate the last move that actually changed the board. A drag-confirmed
+    // drop that the bot then answers: the bot reply animates (the user already
+    // saw their own piece land). Drag with no reply: no slide, to avoid
+    // double-animating the piece the user just dropped.
+    {
+      const lastFrom = data.bot_move ? data.bot_move.slice(0, 2) : from;
+      const lastTo = data.bot_move ? data.bot_move.slice(2, 4) : to;
+      const lastSan = data.bot_move ? (data.bot_san || '') : (data.san_human || '');
+      state.fx = { from: lastFrom, to: lastTo,
+                   slide: !(via === 'drag' && !data.bot_move),
+                   capture: lastSan.indexOf('x') >= 0 };
+    }
     state.sanSeq.push(data.san_human);
     if (data.bot_san) state.sanSeq.push(data.bot_san);
     state.checkpoints.push({ fen: beforeFen, what: 'human', sanH: data.san_human, sanB: data.bot_san });
@@ -1365,6 +1609,7 @@ function undo() {
   state.over = false; state.result = null; state.last = null; state.hint = null;
   state.sanSeq = state.sanSeq.slice(0, Math.max(0, state.sanSeq.length - (cp.sanB ? 2 : 1)));
   state.clockTurn = state.myColor;
+  state.fx = null;
   setStatus('Your turn');
   rebuildMoves();
   closeModal();
@@ -1412,7 +1657,9 @@ function refreshLeaderboard() {
   note.textContent = 'Loading…';
   fetch('/api/leaderboard').then(r => r.json()).then(d => {
     if (!d || !d.available) {
-      note.textContent = 'Leaderboard unavailable (no DATABASE_URL configured on the server).';
+      note.textContent = (d && d.reason)
+        ? 'Leaderboard unavailable: ' + d.reason + '. Set DATABASE_URL to a real Postgres DSN.'
+        : 'Leaderboard unavailable (no DATABASE_URL configured on the server).';
       $('lb-top').querySelector('tbody').innerHTML = '<tr><td colspan="5">—</td></tr>';
       $('lb-recent').querySelector('tbody').innerHTML = '<tr><td colspan="4">—</td></tr>';
       return;
@@ -1451,6 +1698,9 @@ function openModal() {
   $('m-title').textContent = outcome;
   $('m-result').textContent = `${state.result} — ${state.status}`;
   $('m-save').innerHTML = '';
+  const br = $('btn-review');
+  br.style.display = ((state.sanSeq || []).filter(Boolean).length >= 2) ? 'inline-block' : 'none';
+  closeReview();
   fetch('/api/leaderboard').then(r => r.json()).then(d => {
     if (d && d.available) {
       const savedName = localStorage.getItem('cs_name') || '';
@@ -1491,6 +1741,108 @@ async function saveScore() {
   } else {
     toast('Leaderboard unavailable right now');
   }
+}
+
+// ------------------------------------------------------------- game review --
+let rvBusy = false;
+const rvCache = new Map();
+function rvKey() { return (state.sanSeq || []).join('|'); }
+function rvFmtCp(cp) {
+  if (cp === null || cp === undefined) return '—';
+  if (cp >= 99990 || cp <= -99990) return cp > 0 ? 'M' : '-M';
+  return (cp > 0 ? '+' : '') + Math.round(cp);
+}
+async function toggleReview() {
+  const panel = $('review');
+  if (panel.classList.contains('open')) { closeReview(); return; }
+  const sans = (state.sanSeq || []).filter(Boolean);
+  if (sans.length < 2) { toast('Nothing to review yet'); return; }
+  const key = rvKey();
+  if (rvCache.has(key)) { openReview(); renderReview(rvCache.get(key)); return; }
+  if (rvBusy) return;
+  rvBusy = true;
+  openReview();
+  $('rv-body').innerHTML = '<div class="rv-hl">Analyzing every move with PST + quiescence… ' +
+    'usually 20-40 seconds on a full game. New game if you\u2019d rather not wait.</div>';
+  try {
+    const res = await fetch('/api/review', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sans }),
+    });
+    const d = await res.json();
+    if (!d || !d.ok) { closeReview(); toast('Review unavailable right now'); return; }
+    rvCache.set(key, d);
+    renderReview(d);
+  } catch (e) {
+    closeReview(); toast('Review failed — try again');
+  } finally {
+    rvBusy = false;
+  }
+}
+function openReview() { $('modal-box').classList.add('wide'); $('review').classList.add('open'); }
+function closeReview() { $('review').classList.remove('open'); $('modal-box').classList.remove('wide'); }
+function renderReview(d) {
+  const mine = d.accuracy[state.myColor];
+  const theirs = d.accuracy[myBotColor()];
+  const acplM = Math.round(d.acpl[state.myColor] || 0);
+  const acplT = Math.round(d.acpl[myBotColor()] || 0);
+  const YOU = state.myColor === 'w' ? 'You' : 'Bot';
+  const BOT = myBotColor() === 'b' ? 'Bot' : 'You';
+  $('rv-body').innerHTML =
+    '<div class="rv-acc">' +
+      '<div class="chip"><b>' + (mine == null ? '–' : mine) + '%</b><span>' + esc(YOU) +
+        ' · ACPL ' + acplM + '</span></div>' +
+      '<div class="chip"><b>' + (theirs == null ? '–' : theirs) + '%</b><span>' + esc(BOT) +
+        ' · ACPL ' + acplT + '</span></div>' +
+    '</div>' +
+    rvGraphSVG(d.graph || []) +
+    rvHighlights(d) +
+    rvTable(d.moves || []);
+}
+function rvGraphSVG(graph) {
+  const W = 520, H = 130, P = 8;
+  const cps = graph.map(g => Math.max(-400, Math.min(400, g.cp || 0)));
+  const n = cps.length || 1;
+  const m = Math.max(1, Math.max.apply(null, cps.map(Math.abs)));
+  const x = i => P + (i / (n - 1 || 1)) * (W - P * 2);
+  const y = cp => H / 2 - (cp / m) * (H / 2 - P);
+  const line = cps.map((cp, i) => x(i).toFixed(1) + ',' + y(cp).toFixed(1)).join(' ');
+  const area = x(0).toFixed(1) + ',' + (H / 2).toFixed(1) + ' ' + line + ' ' +
+    x(n - 1).toFixed(1) + ',' + (H / 2).toFixed(1);
+  return '<svg id="rv-graph" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+    '<line x1="0" y1="' + (H / 2) + '" x2="' + W + '" y2="' + (H / 2) +
+    '" stroke="var(--border)" stroke-width="1" stroke-dasharray="2,3"/>' +
+    '<polygon points="' + area + '" fill="rgba(232,182,76,.14)"/>' +
+    '<polyline points="' + line + '" fill="none" stroke="var(--accent)" stroke-width="1.6"/>' +
+    '</svg>';
+}
+function rvHighlights(d) {
+  const h = d.highlights || {};
+  let s = '';
+  if (h.best) {
+    s += '<div class="rv-hl"><b>Best move:</b> ply ' + h.best.p + ' — ' + esc(h.best.san) +
+      ' (' + (h.best.loss > 0 ? '-' + h.best.loss + ' cp' : 'the best the evaluator found') + ')</div>';
+  }
+  if (h.blunder && h.blunder.loss > 100) {
+    s += '<div class="rv-hl"><b>Biggest blunder:</b> ply ' + h.blunder.p + ' — ' + esc(h.blunder.san) +
+      ' lost <b>' + h.blunder.loss + ' cp</b> vs the best move</div>';
+  } else {
+    const topLoss = h.blunder && h.blunder.loss != null ? h.blunder.loss : 0;
+    s += '<div class="rv-hl"><b>No blunders</b> — worst move was <b>' + topLoss + ' cp</b> off</div>';
+  }
+  s += '<div class="rv-hl">Eval is White\u2019s POV (cp) after each ply; grade thresholds: best 0 · ' +
+    'good 1-24 · inaccuracy 25-49 · mistake 50-100 · blunder &gt;100.</div>';
+  return s;
+}
+function rvTable(moves) {
+  if (!moves.length) return '<div class="rv-hl">No analyzable moves.</div>';
+  let rows = moves.map(r =>
+    '<tr><td>' + r.p + '</td><td>' + esc(r.san) + '</td><td>' + rvFmtCp(r.cp) +
+    '</td><td>' + (r.loss == null ? '—' : Math.round(r.loss)) + '</td><td>' +
+    (r.label ? '<span class="rv-grade ' + esc(r.label) + '">' + r.label + '</span>' : '<span>—</span>') +
+    '</td></tr>').join('');
+  return '<div id="rv-table-wrap"><table class="rv"><thead><tr><th>Ply</th><th>Move</th>' +
+    '<th>Eval</th><th>Loss</th><th>Grade</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
 }
 
 // ------------------------------------------------------------------ toast ---
@@ -1537,6 +1889,7 @@ function resumeGame() {
     if (!s || !s.fen) return;
     Object.assign(state, s);
     state.hint = null; state.thinking = false; state.selected = null; state.targets = [];
+    state.fx = null;
     dismissResume();
     syncControlsFromState();
     rebuildMoves();
