@@ -90,8 +90,8 @@ def _time_for_depth(depth):
 
 
 REVIEW_THRESHOLDS = {
-    "best": 0, "good": 25, "inaccuracy": 50, "mistake": 100, "blunder": 100,
-    "note": "loss cp brackets: best 0; good 1-24; inaccuracy 25-49; "
+    "best": 0, "excellent": 12, "good": 25, "inaccuracy": 50, "mistake": 100, "blunder": 100,
+    "note": "loss cp brackets: best 0; excellent 1-11; good 12-24; inaccuracy 25-49; "
             "mistake 50-100; blunder >100 (= evaluate CLI --blunder default)",
 }
 
@@ -104,12 +104,15 @@ def _rnd2(x):
     return round(x, 2) if x is not None else None
 
 
-def _review_label(loss):
-    """Classify a centipawn loss into Best/Good/Inaccuracy/Mistake/Blunder."""
+def _review_label(loss, is_approx=False):
+    """Classify a centipawn loss into Best/Excellent/Good/Inaccuracy/Mistake/Blunder.
+    If is_approx=True, returns 'miss' or 'brilliant' for approximate tiers."""
     if loss is None:
         return None
     if loss <= REVIEW_THRESHOLDS["best"]:
         return "best"
+    if loss < REVIEW_THRESHOLDS["excellent"]:
+        return "excellent"
     if loss < REVIEW_THRESHOLDS["good"]:
         return "good"
     if loss < REVIEW_THRESHOLDS["inaccuracy"]:
@@ -117,6 +120,22 @@ def _review_label(loss):
     if loss <= REVIEW_THRESHOLDS["mistake"]:
         return "mistake"
     return "blunder"
+
+
+def _classify_move(loss, best_is_played, runner_up_loss, material_delta, color, mv, board):
+    """Return detailed classification including approximate tiers.
+    Returns dict with: label, approx (bool), approx_type ('miss'|'brilliant'|None)."""
+    base = _review_label(loss)
+    # Miss: blunder-tier with unusually large CPL (>= 2x blunder threshold = 200)
+    if base == "blunder" and loss is not None and loss >= 200:
+        return {"label": "miss", "approx": True, "approx_type": "miss", "base": base}
+    # Brilliant: best/near-best (excellent or better) AND material loss (sacrifice)
+    if base in ("best", "excellent") and material_delta is not None and material_delta < 0:
+        return {"label": "brilliant", "approx": True, "approx_type": "brilliant", "base": base}
+    # Great: played move is best/near-best AND runner-up is well above mistake threshold
+    if best_is_played and runner_up_loss is not None and runner_up_loss > REVIEW_THRESHOLDS["mistake"]:
+        return {"label": "great", "approx": False, "approx_type": None, "base": base}
+    return {"label": base, "approx": False, "approx_type": None, "base": base}
 
 
 def _review_accuracy(acpl):
@@ -495,6 +514,14 @@ def review():
             cp_before = graph[-1]["cp"]
             best_uci = None
             loss = None
+            runner_up_loss = None
+            best_is_played = False
+            material_delta = None
+
+            # Material before move (side to move)
+            mats_before = NS["evaluate_board"](board, None)
+            # Material delta will be computed after we know if it's a sacrifice
+
             if not board.is_game_over():
                 player = "w" if white_turn else "b"
                 best_uci = NS["play_nn"](board.fen(), None, player=player,
@@ -510,15 +537,46 @@ def review():
                     best_pov = bcwp if white_turn else -bcwp
                     actual_pov = acwp if white_turn else -acwp
                     loss = chess_bot._mate_loss(best_pov, actual_pov)
+                    best_is_played = (best_uci == mv.uci())
+
+                    # Compute runner-up loss only when played move is best/near-best
+                    # (loss <= excellent threshold) to save time
+                    if best_is_played and loss is not None and loss <= REVIEW_THRESHOLDS["excellent"]:
+                        # Find second-best move by excluding best_uci
+                        legal = list(board.legal_moves)
+                        alt_losses = []
+                        for lm in legal:
+                            if lm.uci() == best_uci:
+                                continue
+                            b2 = board.copy()
+                            b2.push(lm)
+                            alt_cp = float(NS["evaluate_board"](b2, None))
+                            alt_pov = alt_cp if white_turn else -alt_cp
+                            alt_loss = chess_bot._mate_loss(best_pov, alt_pov)
+                            if alt_loss is not None:
+                                alt_losses.append(alt_loss)
+                        if alt_losses:
+                            runner_up_loss = min(alt_losses)
+
+                    # Material delta for brilliant detection (sacrifice = material loss for mover)
+                    # Positive = good for White, negative = good for Black
+                    mat_after = float(NS["evaluate_board"](ba, None))
+                    # material_delta from mover's perspective: negative = lost material
+                    material_delta = (mat_after - mats_before) if white_turn else (mats_before - mat_after)
+
             board.push(mv)
             cp_after = int(round(float(NS["evaluate_board"](board, None))))
             if loss is not None:
                 losses_by[color].append(loss)
             graph.append({"p": ply, "cp": cp_after})
+            cls = _classify_move(loss, best_is_played, runner_up_loss, material_delta, color, mv, board)
             rows.append({
                 "p": ply, "c": color, "san": clean[idx], "uci": mv.uci(),
-                "best": best_uci, "loss": _rnd1(loss), "label": _review_label(loss),
+                "best": best_uci, "loss": _rnd1(loss), "label": cls["label"],
+                "approx": cls["approx"], "approx_type": cls["approx_type"], "base": cls["base"],
                 "cp": cp_after, "gain": abs(cp_after - cp_before),
+                "runner_up_loss": _rnd1(runner_up_loss) if runner_up_loss is not None else None,
+                "material_delta": _rnd1(material_delta) if material_delta is not None else None,
             })
         elapsed = _time.monotonic() - t0
 
@@ -870,8 +928,43 @@ INDEX_HTML = r"""<!doctype html>
   #rv-table-wrap { max-height:230px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
   table.rv { width:100%; border-collapse:collapse; font-size:12px; }
   table.rv th, table.rv td { padding:3px 7px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
-  table.rv th { color:var(--sub); font-weight:600; font-size:10.5px;
-                position:sticky; top:0; background:var(--panel2); }
+table.rv th { color:var(--sub); font-weight:600; font-size:10.5px;
+              position:sticky; top:0; background:var(--panel2); }
+
+  .rv-nav { display:flex; align-items:center; justify-content:center; gap:12px; margin:6px 0 10px; }
+  .rv-btn { width:36px; height:36px; border-radius:8px; border:1px solid var(--border);
+            background:var(--panel2); color:var(--txt); font-size:16px; cursor:pointer;
+            display:flex; align-items:center; justify-content:center; }
+  .rv-btn:hover { filter:brightness(1.15); }
+  .rv-btn:disabled { opacity:0.4; cursor:not-allowed; }
+  #rv-ply-indicator { min-width:120px; text-align:center; font-size:13px; color:var(--txt); font-weight:600; }
+
+  .rv-main { display:flex; gap:14px; align-items:flex-start; }
+  .rv-board-wrap { flex:0 0 280px; }
+  .rv-miniboard { width:280px; height:280px; border:1px solid var(--border); border-radius:8px;
+                  background:var(--panel2); position:relative; overflow:hidden; }
+  .rv-miniboard .cell { width:35px; height:35px; }
+  .rv-miniboard .cell img { width:35px; height:35px; }
+  .rv-miniboard .coord { font-size:8px; }
+  .rv-miniboard .last-from, .rv-miniboard .last-to { box-shadow:inset 0 0 0 2px var(--accent); }
+  .rv-miniboard .in-check { animation:check-pulse .55s ease-in-out 2; }
+  .rv-legend { font-size:11px; color:var(--sub); margin-top:6px; text-align:center; }
+
+  .rv-side { flex:1; min-width:0; }
+  #rv-table-wrap { max-height:380px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+  table.rv tbody tr:hover { background:rgba(255,255,255,.02); }
+  table.rv tbody tr.rv-selected { background:rgba(232,182,76,.12); }
+  table.rv tbody tr.rv-selected td { border-left:3px solid var(--accent); }
+
+  .rv-grade.excellent { background:rgba(125,255,107,.22); color:var(--win); }
+  .rv-grade.great { background:rgba(232,182,76,.22); color:var(--accent); }
+  .rv-grade.miss { background:rgba(255,95,86,.3); color:var(--lose); }
+  .rv-grade.brilliant { background:rgba(232,182,76,.3); color:var(--accent); }
+
+  .rv-grade.rv-approx { position:relative; }
+  .rv-approx-dot { display:inline-block; margin-left:3px; font-size:12px; color:var(--accent); opacity:0.8; }
+
+  .rv-graph-marker { filter:drop-shadow(0 0 2px var(--accent)); }
 
   #resume-bar { position:fixed; left:50%; top:12px; transform:translateX(-50%);
                 background:var(--accent); color:#1e1c1b; font-weight:600;
@@ -1746,6 +1839,7 @@ async function saveScore() {
 // ------------------------------------------------------------- game review --
 let rvBusy = false;
 const rvCache = new Map();
+let rvState = { selectedPly: null, reviewData: null };
 function rvKey() { return (state.sanSeq || []).join('|'); }
 function rvFmtCp(cp) {
   if (cp === null || cp === undefined) return '—';
@@ -1780,8 +1874,19 @@ async function toggleReview() {
   }
 }
 function openReview() { $('modal-box').classList.add('wide'); $('review').classList.add('open'); }
-function closeReview() { $('review').classList.remove('open'); $('modal-box').classList.remove('wide'); }
+function closeReview() {
+  $('review').classList.remove('open');
+  $('modal-box').classList.remove('wide');
+  rvState = { selectedPly: null, reviewData: null };
+}
 function renderReview(d) {
+  rvState.reviewData = d;
+  rvState.selectedPly = d.moves && d.moves.length ? d.moves[d.moves.length - 1].p : null;
+  rebuildReviewUI();
+}
+function rebuildReviewUI() {
+  const d = rvState.reviewData;
+  if (!d) return;
   const mine = d.accuracy[state.myColor];
   const theirs = d.accuracy[myBotColor()];
   const acplM = Math.round(d.acpl[state.myColor] || 0);
@@ -1795,9 +1900,202 @@ function renderReview(d) {
       '<div class="chip"><b>' + (theirs == null ? '–' : theirs) + '%</b><span>' + esc(BOT) +
         ' · ACPL ' + acplT + '</span></div>' +
     '</div>' +
-    rvGraphSVG(d.graph || []) +
-    rvHighlights(d) +
-    rvTable(d.moves || []);
+    '<div class="rv-nav">' +
+      '<button class="rv-btn" id="rv-prev" aria-label="Previous move">◀</button>' +
+      '<span id="rv-ply-indicator">Ply: —</span>' +
+      '<button class="rv-btn" id="rv-next" aria-label="Next move">▶</button>' +
+    '</div>' +
+    '<div class="rv-main">' +
+      '<div class="rv-board-wrap">' +
+        rvMiniBoard() +
+        '<div class="rv-legend">Click table row or graph point to jump. Arrow keys: ←/→ navigate.</div>' +
+      '</div>' +
+      '<div class="rv-side">' +
+        rvGraphSVG(d.graph || []) +
+        rvHighlights(d) +
+        rvTable(d.moves || []) +
+      '</div>' +
+    '</div>';
+  bindReviewNav();
+  syncReviewSelection();
+}
+function rvMiniBoard() {
+  return '<div id="rv-miniboard" class="rv-miniboard"></div>';
+}
+function bindReviewNav() {
+  const d = rvState.reviewData;
+  if (!d || !d.moves) return;
+  const maxPly = d.moves[d.moves.length - 1].p;
+  $('rv-prev').onclick = () => { if (rvState.selectedPly > 1) { rvState.selectedPly--; syncReviewSelection(); } };
+  $('rv-next').onclick = () => { if (rvState.selectedPly < maxPly) { rvState.selectedPly++; syncReviewSelection(); } };
+  window.addEventListener('keydown', rvKeydown);
+  function rvKeydown(e) {
+    if (!$('review').classList.contains('open')) { window.removeEventListener('keydown', rvKeydown); return; }
+    if (e.key === 'ArrowLeft' && rvState.selectedPly > 1) { rvState.selectedPly--; syncReviewSelection(); }
+    else if (e.key === 'ArrowRight' && rvState.selectedPly < maxPly) { rvState.selectedPly++; syncReviewSelection(); }
+  }
+}
+function syncReviewSelection() {
+  const d = rvState.reviewData;
+  if (!d || !d.moves) return;
+  const ply = rvState.selectedPly;
+  const move = d.moves.find(m => m.p === ply);
+  if (!move) return;
+  $('rv-ply-indicator').textContent = 'Ply: ' + ply + ' (' + move.san + ')';
+  document.querySelectorAll('#rv-table-wrap tr').forEach((tr, i) => {
+    const rowPly = d.moves[i]?.p;
+    tr.classList.toggle('rv-selected', rowPly === ply);
+    if (rowPly === ply) tr.scrollIntoView({block: 'nearest'});
+  });
+  updateGraphMarker(ply);
+  renderMiniBoard(ply, move);
+}
+function updateGraphMarker(ply) {
+  const svg = $('rv-graph');
+  if (!svg) return;
+  const old = svg.querySelector('.rv-graph-marker');
+  if (old) old.remove();
+  const graph = rvState.reviewData.graph;
+  if (!graph) return;
+  const pt = graph.find(g => g.p === ply);
+  if (!pt) return;
+  const W = 520, H = 130, P = 8;
+  const cps = graph.map(g => Math.max(-400, Math.min(400, g.cp || 0)));
+  const n = cps.length || 1;
+  const m = Math.max(1, Math.max.apply(null, cps.map(Math.abs)));
+  const x = i => P + (i / (n - 1 || 1)) * (W - P * 2);
+  const y = cp => H / 2 - (cp / m) * (H / 2 - P);
+  const idx = graph.indexOf(pt);
+  const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  circle.setAttribute('cx', x(idx).toFixed(1));
+  circle.setAttribute('cy', y(pt.cp).toFixed(1));
+  circle.setAttribute('r', '5');
+  circle.setAttribute('fill', 'var(--accent)');
+  circle.setAttribute('stroke', '#fff');
+  circle.setAttribute('stroke-width', '2');
+  circle.classList.add('rv-graph-marker');
+  svg.appendChild(circle);
+}
+function renderMiniBoard(targetPly, currentMove) {
+  const d = rvState.reviewData;
+  if (!d) return;
+  const reviewFen = buildFenUpToPly(targetPly, d.moves);
+  if (!reviewFen) return;
+  renderMiniBoardAtFen(reviewFen, currentMove, d.moves);
+}
+function buildFenUpToPly(targetPly, moves) {
+  const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  try {
+    const Chess = window.Chess;
+    if (!Chess) return START_FEN;
+    const board = new Chess(START_FEN);
+    for (const m of moves) {
+      if (m.p > targetPly) break;
+      board.move(m.san);
+    }
+    return board.fen();
+  } catch (e) {
+    return START_FEN;
+  }
+}
+function renderMiniBoardAtFen(fen, currentMove, allMoves) {
+  const box = $('rv-miniboard');
+  if (!box) return;
+  box.innerHTML = '';
+  const layout = cellSquares();
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const sq = layout[r * 8 + c];
+      const cell = document.createElement('div');
+      cell.className = 'cell ' + ((r + c) % 2 === 0 ? 'light' : 'dark');
+      cell.id = 'rv-sq-' + sq; cell.dataset.square = sq;
+      const pc = pieceAtFromFen(fen, sq);
+      if (pc) {
+        const code = (pc === pc.toUpperCase() ? 'w' : 'b') + pc.toUpperCase();
+        const img = document.createElement('img');
+        img.src = '/pieces/' + code + '.svg'; img.alt = code;
+        cell.appendChild(img);
+      }
+      if (r === 7) cell.appendChild(coord('file', sq[0]));
+      if (c === 0) cell.appendChild(coord('rank', sq[1]));
+      box.appendChild(cell);
+    }
+  }
+  if (currentMove && currentMove.uci) {
+    const from = currentMove.uci.slice(0,2);
+    const to = currentMove.uci.slice(2,4);
+    const f = $('rv-sq-' + from), t = $('rv-sq-' + to);
+    if (f) f.classList.add('last-from');
+    if (t) t.classList.add('last-to');
+    if (currentMove.best && currentMove.best !== currentMove.uci) {
+      drawBestArrow(currentMove.best);
+    }
+  }
+  const pf = parseFenFromFen(fen);
+  if (pf.inCheck && pf.kings[pf.turn] !== undefined) {
+    const c = $('rv-sq-' + squareName(pf.kings[pf.turn]));
+    if (c) c.classList.add('in-check');
+  }
+}
+function pieceAtFromFen(fen, sq) {
+  const place = fen.split(' ')[0]; let idx = 0;
+  const f = sq.charCodeAt(0) - 97; const r = 8 - (+sq[1]); const target = r * 8 + f;
+  for (const ch of place) {
+    if (ch === '/') continue;
+    if (/\d/.test(ch)) { idx += +ch; continue; }
+    if (idx === target) return ch;
+    idx++;
+  }
+  return null;
+}
+function parseFenFromFen(fen) {
+  const place = fen.split(' ')[0]; const map = {}; let idx = 0;
+  for (const ch of place) {
+    if (ch === '/') continue;
+    if (/\d/.test(ch)) { idx += +ch; continue; }
+    map[idx] = ch; idx++;
+  }
+  const kings = {}; const mats = { w: 0, b: 0 }; const pieceMats = { w: {}, b: {} };
+  for (let sq = 0; sq < 64; sq++) {
+    const ch = map[sq]; if (!ch) continue;
+    const color = ch === ch.toUpperCase() ? 'w' : 'b';
+    const pt = ch.toUpperCase();
+    if (pt === 'K') kings[color] = sq;
+    const v = PIECE_VAL[pt] || 0;
+    mats[color] += v;
+  }
+  const turn = fen.split(' ')[1] === 'w' ? 'w' : 'b';
+  const inCheck = isKingAttacked(map, kings[turn], turn === 'w' ? 'b' : 'w');
+  return { map, kings, turn, inCheck };
+}
+function drawBestArrow(bestUci) {
+  const from = bestUci.slice(0,2), to = bestUci.slice(2,4);
+  const fc = $('rv-sq-' + from), tc = $('rv-sq-' + to);
+  if (!fc || !tc) return;
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:10;';
+  const r1 = fc.getBoundingClientRect(), r2 = tc.getBoundingClientRect();
+  const box = $('rv-miniboard').getBoundingClientRect();
+  const x1 = r1.left + r1.width/2 - box.left, y1 = r1.top + r1.height/2 - box.top;
+  const x2 = r2.left + r2.width/2 - box.left, y2 = r2.top + r2.height/2 - box.top;
+  const line = document.createElementNS(svgNS, 'line');
+  line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+  line.setAttribute('x2', x2); line.setAttribute('y2', y2);
+  line.setAttribute('stroke', 'var(--accent)'); line.setAttribute('stroke-width', '4');
+  line.setAttribute('stroke-linecap', 'round');
+  line.setAttribute('marker-end', 'url(#rv-arrowhead)');
+  const defs = document.createElementNS(svgNS, 'defs');
+  const marker = document.createElementNS(svgNS, 'marker');
+  marker.setAttribute('id', 'rv-arrowhead'); marker.setAttribute('markerWidth', '10');
+  marker.setAttribute('markerHeight', '7'); marker.setAttribute('refX', '9');
+  marker.setAttribute('refY', '3.5'); marker.setAttribute('orient', 'auto');
+  const path = document.createElementNS(svgNS, 'path');
+  path.setAttribute('d', 'M0,0 L10,3.5 L0,7 Z');
+  path.setAttribute('fill', 'var(--accent)');
+  marker.appendChild(path); defs.appendChild(marker); svg.appendChild(defs);
+  svg.appendChild(line);
+  $('rv-miniboard').appendChild(svg);
 }
 function rvGraphSVG(graph) {
   const W = 520, H = 130, P = 8;
@@ -1809,7 +2107,7 @@ function rvGraphSVG(graph) {
   const line = cps.map((cp, i) => x(i).toFixed(1) + ',' + y(cp).toFixed(1)).join(' ');
   const area = x(0).toFixed(1) + ',' + (H / 2).toFixed(1) + ' ' + line + ' ' +
     x(n - 1).toFixed(1) + ',' + (H / 2).toFixed(1);
-  return '<svg id="rv-graph" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+  return '<svg id="rv-graph" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="cursor:pointer;">' +
     '<line x1="0" y1="' + (H / 2) + '" x2="' + W + '" y2="' + (H / 2) +
     '" stroke="var(--border)" stroke-width="1" stroke-dasharray="2,3"/>' +
     '<polygon points="' + area + '" fill="rgba(232,182,76,.14)"/>' +
@@ -1830,21 +2128,39 @@ function rvHighlights(d) {
     const topLoss = h.blunder && h.blunder.loss != null ? h.blunder.loss : 0;
     s += '<div class="rv-hl"><b>No blunders</b> — worst move was <b>' + topLoss + ' cp</b> off</div>';
   }
-  s += '<div class="rv-hl">Eval is White\u2019s POV (cp) after each ply; grade thresholds: best 0 · ' +
-    'good 1-24 · inaccuracy 25-49 · mistake 50-100 · blunder &gt;100.</div>';
+  s += '<div class="rv-hl">Eval is White’s POV (cp) after each ply; grades: best 0 · ' +
+    'excellent 1-11 · good 12-24 · inaccuracy 25-49 · mistake 50-100 · blunder >100 · ' +
+    'miss/brilliant = approximations.</div>';
   return s;
 }
 function rvTable(moves) {
   if (!moves.length) return '<div class="rv-hl">No analyzable moves.</div>';
-  let rows = moves.map(r =>
-    '<tr><td>' + r.p + '</td><td>' + esc(r.san) + '</td><td>' + rvFmtCp(r.cp) +
+  let rows = moves.map((r, i) =>
+    '<tr data-ply="' + r.p + '"><td>' + r.p + '</td><td>' + esc(r.san) + '</td><td>' + rvFmtCp(r.cp) +
     '</td><td>' + (r.loss == null ? '—' : Math.round(r.loss)) + '</td><td>' +
-    (r.label ? '<span class="rv-grade ' + esc(r.label) + '">' + r.label + '</span>' : '<span>—</span>') +
+    (r.label ? rvGradeCell(r) : '<span>—</span>') +
     '</td></tr>').join('');
   return '<div id="rv-table-wrap"><table class="rv"><thead><tr><th>Ply</th><th>Move</th>' +
     '<th>Eval</th><th>Loss</th><th>Grade</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
 }
-
+function rvGradeCell(r) {
+  const label = r.label;
+  const approx = r.approx;
+  const approxType = r.approx_type;
+  const base = r.base;
+  let cls = 'rv-grade ' + esc(label);
+  let tip = '';
+  if (approx) {
+    cls += ' rv-approx';
+    if (approxType === 'miss') tip = 'Approximation: unusually large blunder (\u22652x blunder threshold)';
+    else if (approxType === 'brilliant') tip = 'Approximation: best/near-best move that sacrifices material';
+  } else if (label === 'great') {
+    tip = 'Only move avoiding a significant error (runner-up > mistake threshold)';
+  }
+  const tipAttr = tip ? ' title="' + esc(tip) + '"' : '';
+  const dot = approx ? '<span class="rv-approx-dot" title="' + esc(tip) + '">•</span>' : '';
+  return '<span class="' + cls + '"' + tipAttr + '>' + esc(label) + dot + '</span>';
+}
 // ------------------------------------------------------------------ toast ---
 let toastTimer = null;
 function toast(msg) {
