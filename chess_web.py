@@ -913,7 +913,8 @@ INDEX_HTML = r"""<!doctype html>
   #modal-box { background:var(--panel); border-radius:12px; padding:20px 22px;
                max-width:340px; width:100%; box-shadow:0 14px 40px var(--shadow);
                text-align:center; max-height:88vh; overflow-y:auto; }
-  #modal-box.wide { max-width:560px; text-align:left; }
+  #modal-box.wide { max-width:1040px; width:min(100%,1040px); text-align:left;
+                    max-height:94vh; overflow-y:auto; }
   #modal-box h3 { margin:0 0 6px; font-size:20px; }
   #modal-box .result { font-size:14px; color:var(--sub); margin-bottom:14px; word-break:break-word; }
   #modal-box .actions { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
@@ -957,12 +958,16 @@ table.rv th { color:var(--sub); font-weight:600; font-size:10.5px;
   .rv-btn:disabled { opacity:0.4; cursor:not-allowed; }
   #rv-ply-indicator { min-width:120px; text-align:center; font-size:13px; color:var(--txt); font-weight:600; }
 
-  .rv-main { display:flex; gap:14px; align-items:flex-start; }
-  .rv-board-wrap { flex:0 0 280px; }
-  .rv-miniboard { width:280px; height:280px; border:1px solid var(--border); border-radius:8px;
-                  background:var(--panel2); position:relative; overflow:hidden; }
-  .rv-miniboard .cell { width:35px; height:35px; }
-  .rv-miniboard .cell img { width:35px; height:35px; }
+  .rv-main { display:grid; grid-template-columns:minmax(280px, 420px) minmax(0, 1fr);
+             gap:18px; align-items:start; }
+  .rv-board-wrap { min-width:0; }
+  .rv-miniboard { display:grid; grid-template-columns:repeat(8, 1fr);
+                  grid-template-rows:repeat(8, 1fr); width:100%; max-width:420px;
+                  aspect-ratio:1/1; border:4px solid var(--b-border); border-radius:6px;
+                  background:var(--b-dark); position:relative; overflow:hidden;
+                  box-shadow:0 8px 22px var(--shadow); user-select:none; }
+  .rv-miniboard .cell { width:auto; height:auto; }
+  .rv-miniboard .cell img { width:92%; height:92%; }
   .rv-miniboard .coord { font-size:8px; }
   .rv-miniboard .last-from, .rv-miniboard .last-to { box-shadow:inset 0 0 0 2px var(--accent); }
   .rv-miniboard .in-check { animation:check-pulse .55s ease-in-out 2; }
@@ -983,6 +988,13 @@ table.rv th { color:var(--sub); font-weight:600; font-size:10.5px;
   .rv-approx-dot { display:inline-block; margin-left:3px; font-size:12px; color:var(--accent); opacity:0.8; }
 
   .rv-graph-marker { filter:drop-shadow(0 0 2px var(--accent)); }
+
+  @media (max-width:760px) {
+    #modal-box.wide { padding:16px; }
+    .rv-main { grid-template-columns:1fr; }
+    .rv-board-wrap { width:min(100%,420px); margin:0 auto; }
+    .rv-side { width:100%; }
+  }
 
   #resume-bar { position:fixed; left:50%; top:12px; transform:translateX(-50%);
                 background:var(--accent); color:#1e1c1b; font-weight:600;
