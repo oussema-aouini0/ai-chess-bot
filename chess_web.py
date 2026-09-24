@@ -592,7 +592,7 @@ def review():
                 "p": ply, "c": color, "san": clean[idx], "uci": mv.uci(),
                 "best": best_uci, "loss": _rnd1(loss), "label": cls["label"],
                 "approx": cls["approx"], "approx_type": cls["approx_type"], "base": cls["base"],
-                "cp": cp_after, "gain": abs(cp_after - cp_before),
+              "cp": cp_after, "fen": board.fen(), "gain": abs(cp_after - cp_before),
                 "runner_up_loss": _rnd1(runner_up_loss) if runner_up_loss is not None else None,
                 "material_delta": _rnd1(material_delta) if material_delta is not None else None,
             })
@@ -2015,6 +2015,8 @@ function renderMiniBoard(targetPly, currentMove) {
 }
 function buildFenUpToPly(targetPly, moves) {
   const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+  const recorded = moves.find(m => m.p === targetPly && m.fen);
+  if (recorded) return recorded.fen;
   try {
     const Chess = window.Chess;
     if (!Chess) return START_FEN;
