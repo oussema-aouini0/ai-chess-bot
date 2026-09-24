@@ -46,6 +46,19 @@ except ImportError:
 
 START_FEN = chess.STARTING_FEN
 NS = chess_bot.load_namespace()
+
+# Piece values for material delta (centipawns)
+PIECE_VAL_CP = {chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+                chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0}
+
+
+def _material_delta_cp(board_before, board_after, color):
+    """Return material change in centipawns from `color`'s perspective.
+    Positive = gained material, negative = lost material."""
+    def count(b):
+        return sum(PIECE_VAL_CP.get(p.piece_type, 0)
+                   for p in b.piece_map().values() if p.color == color)
+    return count(board_after) - count(board_before)
 try:
     NS["torch"].set_num_threads(max(1, int(os.environ.get("TORCH_THREADS", "2"))))
 except Exception:
@@ -94,6 +107,11 @@ REVIEW_THRESHOLDS = {
     "note": "loss cp brackets: best 0; excellent 1-11; good 12-24; inaccuracy 25-49; "
             "mistake 50-100; blunder >100 (= evaluate CLI --blunder default)",
 }
+# Brilliant is only meaningful while the game is still balanced: do not badge a
+# sacrifice as "brilliant" once the mover is already winning by more than a
+# minor piece (being up 400cp+ makes any move less dramatic, and a "brilliant"
+# fired at +555 on the user's report was clearly noise stuck into a won game).
+BRILLIANT_MAX_ADV = float(os.environ.get("BRILLIANT_MAX_ADV", "400"))
 
 
 def _rnd1(x):
@@ -122,15 +140,18 @@ def _review_label(loss, is_approx=False):
     return "blunder"
 
 
-def _classify_move(loss, best_is_played, runner_up_loss, material_delta, color, mv, board):
+def _classify_move(loss, best_is_played, runner_up_loss, material_delta, pre_pov, color, mv, board):
     """Return detailed classification including approximate tiers.
     Returns dict with: label, approx (bool), approx_type ('miss'|'brilliant'|None)."""
     base = _review_label(loss)
     # Miss: blunder-tier with unusually large CPL (>= 2x blunder threshold = 200)
     if base == "blunder" and loss is not None and loss >= 200:
         return {"label": "miss", "approx": True, "approx_type": "miss", "base": base}
-    # Brilliant: best/near-best (excellent or better) AND material loss (sacrifice)
-    if base in ("best", "excellent") and material_delta is not None and material_delta < 0:
+    # Brilliant: strictly best move (CPL=0, not excellent/near-best) AND the mover gives
+    # up at least a minor piece (~300cp), not just a trivial pawn-level fluctuation.
+    # The pre_pov guard keeps sacrifices in won games from being badged.
+    if (base == "best" and material_delta is not None and material_delta < -300
+            and pre_pov is not None and pre_pov < BRILLIANT_MAX_ADV):
         return {"label": "brilliant", "approx": True, "approx_type": "brilliant", "base": base}
     # Great: played move is best/near-best AND runner-up is well above mistake threshold
     if best_is_played and runner_up_loss is not None and runner_up_loss > REVIEW_THRESHOLDS["mistake"]:
@@ -518,10 +539,6 @@ def review():
             best_is_played = False
             material_delta = None
 
-            # Material before move (side to move)
-            mats_before = NS["evaluate_board"](board, None)
-            # Material delta will be computed after we know if it's a sacrifice
-
             if not board.is_game_over():
                 player = "w" if white_turn else "b"
                 best_uci = NS["play_nn"](board.fen(), None, player=player,
@@ -559,17 +576,18 @@ def review():
                             runner_up_loss = min(alt_losses)
 
                     # Material delta for brilliant detection (sacrifice = material loss for mover)
-                    # Positive = good for White, negative = good for Black
-                    mat_after = float(NS["evaluate_board"](ba, None))
-                    # material_delta from mover's perspective: negative = lost material
-                    material_delta = (mat_after - mats_before) if white_turn else (mats_before - mat_after)
+                    # Use actual piece values, not NN eval (which is side-to-move dependent)
+                    mover_color = chess.WHITE if white_turn else chess.BLACK
+                    material_delta = _material_delta_cp(board, ba, mover_color)
 
             board.push(mv)
             cp_after = int(round(float(NS["evaluate_board"](board, None))))
             if loss is not None:
                 losses_by[color].append(loss)
             graph.append({"p": ply, "cp": cp_after})
-            cls = _classify_move(loss, best_is_played, runner_up_loss, material_delta, color, mv, board)
+            pre_pov = cp_before if white_turn else -cp_before
+            cls = _classify_move(loss, best_is_played, runner_up_loss, material_delta,
+                                 pre_pov, color, mv, board)
             rows.append({
                 "p": ply, "c": color, "san": clean[idx], "uci": mv.uci(),
                 "best": best_uci, "loss": _rnd1(loss), "label": cls["label"],
